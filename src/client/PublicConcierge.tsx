@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { PiArrowRight, PiArrowSquareOut, PiCalendarBlank, PiChatCircleText, PiCheck, PiCircleNotch, PiClipboardText, PiEnvelope, PiFileText, PiLockKey, PiPaperPlaneTilt, PiPhone, PiShieldCheck, PiSparkle, PiUser, PiUsersThree, PiWarning } from "react-icons/pi";
 import type { Deliverable, EmployeeId, PublicConversationMessage, PublicIntake, WorkItem } from "../shared/schemas";
 import { api, streamPublicMessage } from "./api";
+import { SafeMessageText } from "./SafeMessageText";
 
 type Message = PublicConversationMessage & {
   pending?: boolean;
@@ -311,7 +312,7 @@ export function PublicConcierge({ onOwner }: { onOwner: () => void }) {
                 {message.role === "specialist" && <span>Studio specialist</span>}
                 {message.role === "receptionist" && <span>Conversation host</span>}
               </header>
-              <p>{message.content}{message.pending && !message.content && <><PiCircleNotch className="spin" /> Joining the conversation…</>}</p>
+              <p><SafeMessageText content={message.content} />{message.pending && !message.content && <><PiCircleNotch className="spin" /> Joining the conversation…</>}</p>
             </div>
           </article>)}
           {(deliverables.length > 0 || workItems.length > 0) && <section className="public-results" aria-label="Conversation work and deliverables">

@@ -31,6 +31,7 @@ import { api, streamEmployeeMessage, type BootstrapData } from "./api";
 import { CrmApp, PrivateAccessGate } from "./Crm";
 import { PublicConcierge } from "./PublicConcierge";
 import { useDialogFocus } from "./useDialogFocus";
+import { SafeMessageText } from "./SafeMessageText";
 
 type WindowView = "chat" | "soul" | "records" | "memory";
 type ChatMessage = { id: string; role: "owner" | "assistant"; content: string; pending?: boolean };
@@ -461,7 +462,7 @@ function EmployeeWindow({ employee, online, actions, onAction, onMinimize, resum
                   {message.role === "assistant" && <span className="message-avatar"><img src={employee.avatar} alt="" /></span>}
                   <div>
                     <b>{message.role === "assistant" ? employee.title : "Owner"}</b>
-                    <p>{message.content}{message.pending && <PiCircleNotch className="spin inline-spinner" />}</p>
+                    <p><SafeMessageText content={message.content} />{message.pending && <PiCircleNotch className="spin inline-spinner" />}</p>
                   </div>
                 </article>
               ))}
