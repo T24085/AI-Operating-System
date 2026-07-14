@@ -26,10 +26,11 @@ import {
   PiWarning,
   PiX,
 } from "react-icons/pi";
-import type { ActionProposal, EmployeeConversationSummary, EmployeeDefinition, EmployeeId, OnboardingInput, Settings, WorkItem } from "../shared/schemas";
+import type { ActionProposal, BackupManifest, DiagnosticsResponse, EmployeeConversationSummary, EmployeeDefinition, EmployeeId, OnboardingInput, Settings, WorkItem } from "../shared/schemas";
 import { api, streamEmployeeMessage, type BootstrapData } from "./api";
 import { CrmApp, PrivateAccessGate } from "./Crm";
 import { PublicConcierge } from "./PublicConcierge";
+import { useDialogFocus } from "./useDialogFocus";
 
 type WindowView = "chat" | "soul" | "records" | "memory";
 type ChatMessage = { id: string; role: "owner" | "assistant"; content: string; pending?: boolean };
@@ -595,7 +596,8 @@ function AppointmentApprovalCard({ workItem, onDone }: { workItem: WorkItem; onD
       <div className="approval-title"><PiCalendarBlank /><span><strong>{workItem.title}</strong><small>Tentative customer hold</small></span></div>
       <label>Requested time</label><p>{when}</p>
       <label>Next step</label><p>{workItem.nextStep}</p>
-      {error && <div className="approval-error">{error}</div>}
+      {error && <div className="approval-error" role="alert">{error}</div>}
+      <span className="sr-only" aria-live="polite">{busy ? `${busy === "confirm" ? "Confirming" : "Declining"} meeting.` : ""}</span>
       <div className="approval-actions"><button className="approve" disabled={Boolean(busy)} onClick={() => void decide("confirm")}>{busy === "confirm" ? <PiCircleNotch className="spin" /> : <PiCheck />} Confirm meeting</button><button disabled={Boolean(busy)} onClick={() => void decide("decline")}>{busy === "decline" ? <PiCircleNotch className="spin" /> : <PiX />} Decline</button></div>
     </article>
   );
@@ -624,7 +626,8 @@ function ApprovalCard({ action, onDone }: { action: ActionProposal; onDone: (res
       <label>Why</label>
       <p>{action.reason}</p>
       <details><summary>Review preview</summary><pre>{action.preview}</pre></details>
-      {error && <div className="approval-error">{error}</div>}
+      {error && <div className="approval-error" role="alert">{error}</div>}
+      <span className="sr-only" aria-live="polite">{busy ? `${busy === "approve" ? "Approving" : "Denying"} action.` : ""}</span>
       <div className="approval-actions"><button className="approve" disabled={Boolean(busy)} onClick={() => void decide("approve")}>{busy === "approve" ? <PiCircleNotch className="spin" /> : <PiCheck />} Approve action</button><button disabled={Boolean(busy)} onClick={() => void decide("deny")}>{busy === "deny" ? <PiCircleNotch className="spin" /> : <PiX />} Deny</button></div>
     </article>
   );
@@ -668,7 +671,12 @@ function SettingsModal({ settings, employees, onClose, onSaved }: { settings: Se
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [backupMessage, setBackupMessage] = useState<string | null>(null);
-  useEffect(() => { api.models().then(setModels).catch((reason) => setError(reason.message)); }, []);
+  const [diagnostics, setDiagnostics] = useState<DiagnosticsResponse | null>(null);
+  const [backups, setBackups] = useState<BackupManifest[]>([]);
+  const [restoreId, setRestoreId] = useState("");
+  const [restoreConfirmation, setRestoreConfirmation] = useState("");
+  const refreshReliability = async () => { const [nextDiagnostics, nextBackups] = await Promise.all([api.diagnostics(), api.backups()]); setDiagnostics(nextDiagnostics); setBackups(nextBackups); if (!restoreId && nextBackups[0]) setRestoreId(nextBackups[0].backupId); };
+  useEffect(() => { api.models().then(setModels).catch(() => setModels([])); refreshReliability().catch((reason) => setError(reason.message)); }, []);
   const save = async () => {
     setBusy(true);
     try { onSaved(await api.settings(draft)); onClose(); } catch (reason) { setError(reason instanceof Error ? reason.message : "Unable to save settings."); } finally { setBusy(false); }
@@ -680,16 +688,22 @@ function SettingsModal({ settings, employees, onClose, onSaved }: { settings: Se
           <h3>Runtime</h3>
           <label>Default Ollama model<select value={draft.defaultModel} onChange={(event) => setDraft({ ...draft, defaultModel: event.target.value })}>{models.map((model) => <option key={model.name}>{model.name}</option>)}</select></label>
           <label>Context length<input type="number" min={2048} max={262144} step={1024} value={draft.contextLength} onChange={(event) => setDraft({ ...draft, contextLength: Number(event.target.value) })} /></label>
-          <label>Conversation retention<input type="number" min={0} max={3650} value={draft.retentionDays} onChange={(event) => setDraft({ ...draft, retentionDays: Number(event.target.value) })} /><small>Days to retain records. Use 0 to retain indefinitely; cleanup is always an explicit owner action.</small></label>
           <button className="secondary-button" onClick={() => void api.openFolder()}><PiFolderOpen /> Open Markdown workspace</button>
-          <button className="secondary-button" onClick={async () => { setBusy(true); setError(null); try { const result = await api.backup(); setBackupMessage(`Backup created: ${result.path}`); } catch (reason) { setError(reason instanceof Error ? reason.message : "Unable to create backup."); } finally { setBusy(false); } }}><PiDatabase /> Create workspace backup</button>
-          {backupMessage && <p className="settings-success"><PiCheck /> {backupMessage}</p>}
+          <button className="secondary-button" onClick={async () => { setBusy(true); setError(null); try { const result = await api.createBackup(); setBackupMessage(`Validated backup created: ${result.backupId}`); await refreshReliability(); } catch (reason) { setError(reason instanceof Error ? reason.message : "Unable to create backup."); } finally { setBusy(false); } }}><PiDatabase /> Create validated backup</button>
+          {backupMessage && <p className="settings-success" role="status"><PiCheck /> {backupMessage}</p>}
         </section>
         <section>
           <h3>Employee model overrides</h3>
           <div className="role-models">{employees.map((employee) => <label key={employee.id}><span><img src={employee.avatar} alt="" />{employee.title}</span><select value={draft.roleModels[employee.id] ?? ""} onChange={(event) => setDraft({ ...draft, roleModels: { ...draft.roleModels, [employee.id]: event.target.value } })}><option value="">Use default</option>{models.map((model) => <option key={model.name}>{model.name}</option>)}</select></label>)}</div>
         </section>
-        {error && <div className="form-error"><PiWarning /> {error}</div>}
+        <section className="diagnostics-panel" aria-labelledby="diagnostics-heading">
+          <div className="diagnostics-heading"><div><h3 id="diagnostics-heading">Diagnostics & recovery</h3><p>Canonical record health, local model status, search freshness, and validated backups.</p></div><button className="secondary-button" onClick={() => void refreshReliability()} disabled={busy}>Refresh</button></div>
+          {diagnostics && <div className="diagnostics-grid" aria-live="polite"><span><small>Ollama</small><strong className={diagnostics.ollamaOnline ? "healthy" : "unhealthy"}>{diagnostics.ollamaOnline ? "Online" : "Offline"}</strong></span><span><small>Malformed records</small><strong className={diagnostics.malformedRecords.length ? "unhealthy" : "healthy"}>{diagnostics.malformedRecords.length}</strong></span><span><small>Pending approvals</small><strong>{diagnostics.pendingActions}</strong></span><span><small>Pending work</small><strong>{diagnostics.pendingWorkItems}</strong></span></div>}
+          {diagnostics?.malformedRecords.length ? <div className="diagnostics-issues" role="alert">{diagnostics.malformedRecords.map((issue) => <article key={issue.path}><strong>{issue.path}</strong><span>{issue.recordKind} · schema v{issue.schemaVersion}</span><p>{issue.validationError}</p></article>)}</div> : diagnostics && <p className="diagnostics-clean"><PiShieldCheck /> All canonical records parsed successfully.</p>}
+          <div className="diagnostics-actions"><button className="secondary-button" onClick={async () => { setBusy(true); setError(null); try { const result = await api.reindex(); setBackupMessage(`Search index rebuilt: ${new Date(result.indexFreshAt).toLocaleString()}`); await refreshReliability(); } catch (reason) { setError(reason instanceof Error ? reason.message : "Unable to rebuild the index."); } finally { setBusy(false); } }} disabled={busy}><PiPulse /> Rebuild search index</button>{diagnostics?.latestValidatedBackup && <span>Latest backup <strong>{new Date(diagnostics.latestValidatedBackup.createdAt).toLocaleString()}</strong></span>}</div>
+          {backups.length > 0 && <div className="restore-controls"><label>Validated backup<select value={restoreId} onChange={(event) => { setRestoreId(event.target.value); setRestoreConfirmation(""); }}>{backups.map((backup) => <option key={backup.backupId} value={backup.backupId}>{new Date(backup.createdAt).toLocaleString()} · {backup.reason}</option>)}</select></label><label>Confirmation<input value={restoreConfirmation} onChange={(event) => setRestoreConfirmation(event.target.value)} placeholder={`RESTORE ${restoreId}`} /></label><button className="danger-button" disabled={busy || restoreConfirmation !== `RESTORE ${restoreId}`} onClick={async () => { setBusy(true); setError(null); try { await api.restoreBackup(restoreId, restoreConfirmation); setBackupMessage(`Restored ${restoreId}; a pre-restore backup was created and the index rebuilt.`); setRestoreConfirmation(""); await refreshReliability(); } catch (reason) { setError(reason instanceof Error ? reason.message : "Unable to restore the backup."); } finally { setBusy(false); } }}>Restore backup</button></div>}
+        </section>
+        {error && <div className="form-error" role="alert"><PiWarning /> {error}</div>}
       </div>
       <div className="modal-footer"><button className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" onClick={() => void save()} disabled={busy}>{busy ? <PiCircleNotch className="spin" /> : "Save settings"}</button></div>
     </Modal>
@@ -697,5 +711,6 @@ function SettingsModal({ settings, employees, onClose, onSaved }: { settings: Se
 }
 
 function Modal({ title, onClose, children, wide }: { title: string; onClose: () => void; children: ReactNode; wide?: boolean }) {
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className={`modal ${wide ? "wide" : ""}`} role="dialog" aria-modal="true" aria-label={title}><header><strong>{title}</strong><button aria-label="Close" onClick={onClose}><PiX /></button></header>{children}</section></div>;
+  const dialogRef = useDialogFocus<HTMLElement>(onClose);
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section ref={dialogRef} tabIndex={-1} className={`modal ${wide ? "wide" : ""}`} role="dialog" aria-modal="true" aria-label={title}><header><strong>{title}</strong><button aria-label="Close" onClick={onClose}><PiX /></button></header>{children}</section></div>;
 }

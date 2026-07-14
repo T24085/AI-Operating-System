@@ -13,6 +13,7 @@ export interface SearchResult {
 export class RecordsIndex {
   private db: Database.Database | null = null;
   private watcher: FSWatcher | null = null;
+  private lastIndexedAt: string | null = null;
 
   constructor(private records: WorkspaceRecords) {}
 
@@ -49,6 +50,7 @@ export class RecordsIndex {
     if (!this.db) return;
     this.db.exec("DELETE FROM records_fts");
     for (const file of await this.records.allMarkdownFiles()) await this.indexFile(file);
+    this.lastIndexedAt = new Date().toISOString();
   }
 
   async indexFile(file: string): Promise<void> {
@@ -61,6 +63,7 @@ export class RecordsIndex {
       this.db!.prepare("INSERT INTO records_fts(path, title, content) VALUES (?, ?, ?)").run(path, title, content);
     });
     transaction();
+    this.lastIndexedAt = new Date().toISOString();
   }
 
   removeFile(file: string): void {
@@ -83,4 +86,6 @@ export class RecordsIndex {
       )
       .all(safe, limit) as SearchResult[];
   }
+
+  freshness(): string | null { return this.lastIndexedAt; }
 }

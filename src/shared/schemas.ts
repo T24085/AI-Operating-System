@@ -56,6 +56,42 @@ export const SettingsSchema = z.object({
 
 export type Settings = z.infer<typeof SettingsSchema>;
 
+export const RecordHealthIssueSchema = z.object({
+  path: z.string(),
+  recordKind: z.string(),
+  validationError: z.string(),
+  severity: z.enum(["warning", "error"]),
+  detectedAt: z.string(),
+  schemaVersion: z.number().int().min(0),
+});
+export type RecordHealthIssue = z.infer<typeof RecordHealthIssueSchema>;
+
+export const BackupManifestFileSchema = z.object({
+  path: z.string(),
+  size: z.number().int().min(0),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+});
+export const BackupManifestSchema = z.object({
+  schemaVersion: z.literal(1),
+  backupId: z.string(),
+  createdAt: z.string(),
+  workspaceSlug: z.string(),
+  reason: z.enum(["manual", "pre-restore"]),
+  files: z.array(BackupManifestFileSchema),
+  manifestHash: z.string().regex(/^[a-f0-9]{64}$/),
+});
+export type BackupManifest = z.infer<typeof BackupManifestSchema>;
+
+export const DiagnosticsResponseSchema = z.object({
+  ollamaOnline: z.boolean(),
+  indexFreshAt: z.string().nullable(),
+  malformedRecords: z.array(RecordHealthIssueSchema),
+  latestValidatedBackup: BackupManifestSchema.nullable(),
+  pendingActions: z.number().int().min(0),
+  pendingWorkItems: z.number().int().min(0),
+});
+export type DiagnosticsResponse = z.infer<typeof DiagnosticsResponseSchema>;
+
 export const ConversationRecordSchema = z.object({
   id: z.string(),
   employeeId: EmployeeIdSchema,
@@ -100,6 +136,14 @@ export const DeliverableSchema = z.object({
   accessUrl: z.string().optional(), file: z.string(),
 });
 export type Deliverable = z.infer<typeof DeliverableSchema>;
+
+export const DeliverableAccessGrantSchema = z.object({
+  id: z.string(),
+  tokenHash: z.string().regex(/^[a-f0-9]{64}$/),
+  issuedAt: z.string(),
+  revokedAt: z.string().nullable().default(null),
+});
+export type DeliverableAccessGrant = z.infer<typeof DeliverableAccessGrantSchema>;
 
 export const OfferSchema = z.object({
   id: z.string(), business: z.enum(["Samuel.Studio.dev", "Samuel.Studio", "Samuel.Studio Colombia"]),

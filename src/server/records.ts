@@ -6,6 +6,7 @@ import { employees, employeeById } from "../shared/employees.js";
 import { agentOperatingFiles, samuelStudioKnowledgeFiles } from "../shared/agent-souls.js";
 import type { ActionProposal, ConversationRecord, EmployeeId, OnboardingInput } from "../shared/schemas.js";
 import { atomicWriteText, pathExists, readSafeText } from "./paths.js";
+import type { RecordHealthRegistry } from "./reliability.js";
 
 function iso(): string {
   return new Date().toISOString();
@@ -43,7 +44,7 @@ export class WorkspaceRecords {
   readonly conversations = new Map<string, ConversationRecord>();
   readonly actions = new Map<string, ActionProposal>();
 
-  constructor(readonly root: string) {}
+  constructor(readonly root: string, private readonly health?: RecordHealthRegistry) {}
 
   async initialize(company: OnboardingInput): Promise<void> {
     await mkdir(this.root, { recursive: true });
@@ -135,7 +136,7 @@ export class WorkspaceRecords {
     const createdAt = iso();
     const record: ConversationRecord = { id, employeeId, title, model, createdAt, file: relativeFile };
     const employee = employeeById.get(employeeId)!;
-    const markdown = `---\nid: ${yamlValue(id)}\nemployee: ${yamlValue(employeeId)}\ntitle: ${yamlValue(title)}\nmodel: ${yamlValue(model)}\ncreated_at: ${yamlValue(createdAt)}\n---\n\n# ${employee.title}: ${title}\n\n`;
+    const markdown = `---\nschema_version: 1\nid: ${yamlValue(id)}\nemployee: ${yamlValue(employeeId)}\ntitle: ${yamlValue(title)}\nmodel: ${yamlValue(model)}\ncreated_at: ${yamlValue(createdAt)}\n---\n\n# ${employee.title}: ${title}\n\n`;
     await atomicWriteText(this.root, relativeFile, markdown);
     this.conversations.set(id, record);
     return record;
@@ -169,7 +170,8 @@ export class WorkspaceRecords {
     const output: Array<{ record: ConversationRecord; content: string }> = [];
     for (const file of await walkMarkdown(join(this.root, "employees", employeeId, "conversations"))) {
       const id = basename(file, ".md");
-      try { output.push(await this.activateConversation(id, employeeId)); } catch { /* Keep malformed records readable on disk but out of the picker. */ }
+      try { output.push(await this.activateConversation(id, employeeId)); this.health?.clear(relative(this.root, file).split("\\").join("/")); }
+      catch (error) { this.health?.report(relative(this.root, file).split("\\").join("/"), "conversation", error); }
     }
     return output.sort((a, b) => b.record.createdAt.localeCompare(a.record.createdAt));
   }
@@ -178,7 +180,7 @@ export class WorkspaceRecords {
     const record = this.conversations.get(conversationId);
     if (!record) throw new Error("Conversation is not active in this server session.");
     const full = join(this.root, record.file);
-    const meta = metadata ? `\n\n<!-- EVENT ${JSON.stringify(metadata).replace(/-->/g, "--\\>")} -->` : "";
+    const meta = metadata ? `\n\n<!-- EVENT ${JSON.stringify({ ...metadata, schemaVersion: 1 }).replace(/-->/g, "--\\>")} -->` : "";
     await appendFile(full, `## ${heading} — ${iso()}\n\n${content}${meta}\n\n`, "utf8");
   }
 
@@ -186,7 +188,7 @@ export class WorkspaceRecords {
     const [year, month] = dateParts(new Date(action.createdAt));
     const relativeFile = `employees/${action.employeeId}/actions/${year}/${month}/${action.id}.md`;
     action.file = relativeFile;
-    const markdown = `---\nid: ${yamlValue(action.id)}\nemployee: ${yamlValue(action.employeeId)}\nconversation: ${yamlValue(action.conversationId)}\ntool: ${yamlValue(action.tool)}\ncreated_at: ${yamlValue(action.createdAt)}\n---\n\n# Proposed action: ${action.summary}\n\n- Status: pending\n- Risk: ${action.risk}\n- Target: ${action.targetPaths.join(", ") || "workspace record"}\n- Approval hash: \`${action.contentHash}\`\n\n## Why\n\n${action.reason}\n\n## Preview\n\n\`\`\`text\n${action.preview}\n\`\`\`\n\n<!-- ACTION_META ${JSON.stringify(action).replace(/-->/g, "--\\>")} -->\n`;
+    const markdown = `---\nschema_version: 1\nid: ${yamlValue(action.id)}\nemployee: ${yamlValue(action.employeeId)}\nconversation: ${yamlValue(action.conversationId)}\ntool: ${yamlValue(action.tool)}\ncreated_at: ${yamlValue(action.createdAt)}\n---\n\n# Proposed action: ${action.summary}\n\n- Status: pending\n- Risk: ${action.risk}\n- Target: ${action.targetPaths.join(", ") || "workspace record"}\n- Approval hash: \`${action.contentHash}\`\n\n## Why\n\n${action.reason}\n\n## Preview\n\n\`\`\`text\n${action.preview}\n\`\`\`\n\n<!-- ACTION_META ${JSON.stringify({ ...action, schemaVersion: 1 }).replace(/-->/g, "--\\>")} -->\n`;
     await atomicWriteText(this.root, relativeFile, markdown);
     this.actions.set(action.id, action);
     return action;
@@ -199,7 +201,7 @@ export class WorkspaceRecords {
     action.decidedAt = iso();
     action.result = detail;
     const full = join(this.root, action.file);
-    const event = { status, detail, at: action.decidedAt };
+    const event = { schemaVersion: 1, status, detail, at: action.decidedAt };
     await appendFile(full, `\n## ${status[0].toUpperCase()}${status.slice(1)} — ${action.decidedAt}\n\n${detail}\n\n<!-- ACTION_EVENT ${JSON.stringify(event).replace(/-->/g, "--\\>")} -->\n`, "utf8");
     return action;
   }
@@ -222,9 +224,7 @@ export class WorkspaceRecords {
           action.decidedAt = last.at;
         }
         this.actions.set(action.id, action);
-      } catch {
-        // A malformed action record stays readable but is excluded from the executable queue.
-      }
+      } catch (error) { this.health?.report(relative(this.root, file).split("\\").join("/"), "action", error); }
     }
   }
 

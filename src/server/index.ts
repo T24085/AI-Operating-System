@@ -1,8 +1,9 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { appendFile, cp, mkdir } from "node:fs/promises";
+import { appendFile, mkdir, rename, rm, stat } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { employees, employeeById } from "../shared/employees.js";
@@ -34,6 +35,8 @@ import { PublicReceptionistRuntime } from "./public-receptionist.js";
 import { issuePublicResumeToken, parsePublicConversation, verifyPublicResumeToken } from "./public-resume.js";
 import { parseEmployeeConversation } from "./employee-conversations.js";
 import { OperationsStore } from "./operations.js";
+import { BackupManager, RecordHealthRegistry } from "./reliability.js";
+import { BoundedRateLimiter } from "./rate-limit.js";
 
 interface Services {
   config: AppConfig;
@@ -44,9 +47,37 @@ interface Services {
   crm: CrmStore;
   publicReceptionist: PublicReceptionistRuntime;
   operations: OperationsStore;
+  health: RecordHealthRegistry;
+  backups: BackupManager;
 }
 
-const app = Fastify({ logger: true, bodyLimit: 1_100_000 });
+function appointmentForWorkItem(
+  workItem: Awaited<ReturnType<OperationsStore["listWorkItems"]>>[number],
+  appointments: Awaited<ReturnType<CrmStore["bootstrap"]>>["appointments"],
+) {
+  const requestedStart = workItem.summary.match(/Tentative hold requested for (.+?)\.?$/)?.[1];
+  return appointments.find((item) => item.id === workItem.appointmentId)
+    ?? appointments.filter((item) => item.contactId === workItem.contactId && Boolean(workItem.conversationId) && item.notes.includes(workItem.conversationId!)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0]
+    ?? appointments.filter((item) => item.contactId === workItem.contactId && Boolean(requestedStart) && item.startAt === requestedStart).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0]
+    ?? appointments.filter((item) => item.status === "tentative" && item.contactId === workItem.contactId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+}
+
+async function reconcileAppointmentWorkItems(crm: CrmStore, operations: OperationsStore): Promise<void> {
+  const [workItems, crmData] = await Promise.all([operations.listWorkItems(), crm.bootstrap()]);
+  for (const workItem of workItems.filter((item) => item.kind === "appointment" && item.status === "awaiting_owner")) {
+    const appointment = appointmentForWorkItem(workItem, crmData.appointments);
+    if (!appointment) continue;
+    if (appointment.status === "cancelled") {
+      await operations.updateWorkItem(workItem.id, { appointmentId: appointment.id, status: "closed", nextStep: "Calendar hold was cancelled; no owner approval remains pending." });
+    } else if (["confirmed", "completed"].includes(appointment.status)) {
+      await operations.updateWorkItem(workItem.id, { appointmentId: appointment.id, status: "delivered", nextStep: appointment.status === "completed" ? "Appointment completed." : "Appointment confirmed by owner." });
+    } else if (!workItem.appointmentId) {
+      await operations.updateWorkItem(workItem.id, { appointmentId: appointment.id });
+    }
+  }
+}
+
+const app = Fastify({ logger: true, bodyLimit: 1_100_000, trustProxy: process.env.AIOS_TRUST_PROXY === "loopback" ? "loopback" : false });
 await app.register(cors, { origin: ["http://127.0.0.1:5173", "http://localhost:5173"] });
 app.addHook("onRequest", async (_request, reply) => {
   reply.header("X-Content-Type-Options", "nosniff"); reply.header("X-Frame-Options", "DENY");
@@ -57,29 +88,47 @@ app.addHook("onRequest", async (_request, reply) => {
 const configStore = new ConfigStore();
 const crmAuth = new CrmAuth(configStore.root);
 let services: Services | null = null;
-async function auditRequest(method: string, url: string, status: number, ip: string): Promise<void> {
+const auditBefore = new WeakMap<object, string>();
+async function workspaceStateHash(current: Services | null): Promise<string> {
+  if (!current) return createHash("sha256").update("not-onboarded").digest("hex");
+  const entries: string[] = [];
+  for (const file of await current.records.allMarkdownFiles()) {
+    const info = await stat(file); entries.push(`${file.slice(current.records.root.length)}:${info.size}:${info.mtimeMs}`);
+  }
+  return createHash("sha256").update(entries.sort().join("\n")).digest("hex");
+}
+async function auditRequest(requestId: string, method: string, url: string, status: number, actor: string, beforeHash: string, afterHash: string): Promise<void> {
   const stamp = new Date(); const dir = join(configStore.root, "audit"); await mkdir(dir, { recursive: true });
   const file = join(dir, `${stamp.toISOString().slice(0, 7)}.md`);
-  await appendFile(file, `\n## ${stamp.toISOString()}\n\n- Method: ${method}\n- Path: ${url.split("?")[0]}\n- Status: ${status}\n- Source: ${ip}\n`, "utf8");
+  const resource = url.split("?")[0]; const result = status >= 200 && status < 400 ? "success" : "failure";
+  await appendFile(file, `\n## ${stamp.toISOString()}\n\n- Request ID: ${requestId}\n- Actor: ${actor}\n- Method: ${method}\n- Resource: ${resource}\n- Result: ${result} (${status})\n- Before hash: ${beforeHash}\n- After hash: ${afterHash}\n`, "utf8");
 }
 app.addHook("onResponse", async (request, reply) => {
-  if (["POST", "PATCH", "PUT", "DELETE"].includes(request.method)) await auditRequest(request.method, request.url, reply.statusCode, request.ip).catch(() => undefined);
+  if (["POST", "PATCH", "PUT", "DELETE"].includes(request.method)) {
+    const actor = crmAuth.authenticated(sessionFrom(request)) ? "owner" : request.url.startsWith("/api/public/") ? "public-visitor" : "local-system";
+    const afterHash = await workspaceStateHash(services).catch(() => "unavailable");
+    await auditRequest(request.id, request.method, request.url, reply.statusCode, actor, auditBefore.get(request) ?? "unavailable", afterHash).catch(() => undefined);
+    auditBefore.delete(request);
+  }
 });
 
 async function createServices(config: AppConfig): Promise<Services> {
-  const records = new WorkspaceRecords(config.workspacePath);
+  const health = new RecordHealthRegistry();
+  const records = new WorkspaceRecords(config.workspacePath, health);
   await records.ensureOperatingFiles();
   await records.loadActions();
   const index = new RecordsIndex(records);
   await index.start();
   const tools = new SafeToolRuntime(records, index);
   const agents = new AgentRuntime(records, tools, config.settings);
-  const crm = new CrmStore(records.root);
+  const crm = new CrmStore(records.root, { health });
   await crm.initialize();
-  const operations = new OperationsStore(records.root);
+  const operations = new OperationsStore(records.root, health);
   await operations.initialize();
+  await reconcileAppointmentWorkItems(crm, operations);
   const publicReceptionist = new PublicReceptionistRuntime(records, crm, operations, config.settings);
-  return { config, records, index, tools, agents, crm, publicReceptionist, operations };
+  const backups = new BackupManager(configStore.root, config);
+  return { config, records, index, tools, agents, crm, publicReceptionist, operations, health, backups };
 }
 
 const existing = await configStore.read();
@@ -103,11 +152,9 @@ const requireInternal = (request: { headers: { cookie?: string } }): Services =>
   return requireServices();
 };
 const requireCrm = (request: { headers: { cookie?: string } }): CrmStore => requireInternal(request).crm;
-const rateWindows = new Map<string, { count: number; resetAt: number }>();
+const rateLimiter = new BoundedRateLimiter();
 function enforceRateLimit(key: string, limit: number, windowMs: number): void {
-  const current = rateWindows.get(key); const time = Date.now();
-  if (!current || current.resetAt <= time) { rateWindows.set(key, { count: 1, resetAt: time + windowMs }); return; }
-  current.count += 1; if (current.count > limit) throw Object.assign(new Error("Too many requests. Please wait and try again."), { statusCode: 429 });
+  rateLimiter.enforce(key, limit, windowMs);
 }
 function requireCsrf(request: { headers: { cookie?: string; [key: string]: unknown } }): void {
   const session = sessionFrom(request); const supplied = typeof request.headers["x-csrf-token"] === "string" ? request.headers["x-csrf-token"] : undefined;
@@ -120,6 +167,7 @@ app.addHook("preHandler", async (request) => {
   const mutating = ["POST", "PATCH", "PUT", "DELETE"].includes(request.method);
   const exempt = url.startsWith("/api/public/") || url === "/api/onboarding" || url === "/api/crm/auth/login" || url === "/api/crm/auth/setup";
   if (mutating && url.startsWith("/api/") && !exempt) requireCsrf(request);
+  if (mutating) auditBefore.set(request, await workspaceStateHash(services).catch(() => "unavailable"));
 });
 
 app.get("/api/bootstrap", async (request) => {
@@ -290,11 +338,47 @@ app.post("/api/open-folder", async (request) => {
   }
   return { ok: false, message: "Open the workspace path shown in Settings." };
 });
+app.get("/api/admin/diagnostics", async (request) => {
+  const current = requireInternal(request);
+  const [malformedRecords, backups, workItems, ollamaOnline] = await Promise.all([
+    current.health.scan(current.records.root), current.backups.list(), current.operations.listWorkItems(), current.agents.online(),
+  ]);
+  return {
+    ollamaOnline, indexFreshAt: current.index.freshness(), malformedRecords, latestValidatedBackup: backups[0] ?? null,
+    pendingActions: current.records.listActions().filter((action) => action.status === "pending").length,
+    pendingWorkItems: workItems.filter((item) => !["delivered", "closed"].includes(item.status)).length,
+  };
+});
+app.post("/api/admin/reindex", async (request) => {
+  const current = requireInternal(request); await current.index.rebuild();
+  return { ok: true, indexFreshAt: current.index.freshness() };
+});
+app.get("/api/admin/backups", async (request) => requireInternal(request).backups.list());
+app.post("/api/admin/backups", async (request, reply) => reply.code(201).send(await requireInternal(request).backups.create("manual")));
 app.post("/api/admin/backup", async (request) => {
-  const current = requireInternal(request); const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const destination = join(configStore.root, "backups", `${current.config.settings.businessSlug ?? "business"}-${stamp}`);
-  await mkdir(join(configStore.root, "backups"), { recursive: true }); await cp(current.config.workspacePath, destination, { recursive: true, errorOnExist: true });
-  return { ok: true, path: destination };
+  const manifest = await requireInternal(request).backups.create("manual");
+  return { ok: true, path: manifest.backupId };
+});
+app.post("/api/admin/backups/:id/restore", async (request) => {
+  const current = requireInternal(request); const { id } = request.params as { id: string };
+  const confirmation = String((request.body as { confirmation?: unknown })?.confirmation ?? "");
+  const staged = await current.backups.stageRestore(id, confirmation);
+  await current.index.close();
+  try {
+    await current.backups.swapRestore(staged.staging, staged.rollback);
+    services = await createServices(current.config);
+    await rm(staged.rollback, { recursive: true, force: true });
+  } catch (error) {
+    try {
+      if (existsSync(staged.rollback)) {
+        if (existsSync(current.config.workspacePath)) await rename(current.config.workspacePath, staged.staging);
+        await rename(staged.rollback, current.config.workspacePath);
+      }
+      services = await createServices(current.config);
+    } catch { services = null; }
+    throw error;
+  }
+  return { ok: true, backup: staged.manifest, indexFreshAt: services.index.freshness() };
 });
 
 app.get("/api/crm/auth", async (request) => ({ configured: await crmAuth.configured(), authenticated: crmAuth.authenticated(sessionFrom(request)), csrfToken: crmAuth.csrfFor(sessionFrom(request)) }));
@@ -331,10 +415,16 @@ app.post("/api/work-items/:id/decision", async (request, reply) => {
   if (!workItem || workItem.kind !== "appointment") return reply.code(404).send({ error: "Appointment request not found." });
   if (workItem.status !== "awaiting_owner") return reply.code(409).send({ error: `Appointment request is already ${workItem.status}.` });
   const crm = await current.crm.bootstrap();
-  const appointment = crm.appointments.find((item) => item.id === workItem.appointmentId)
-    ?? crm.appointments.filter((item) => item.status === "tentative" && item.contactId === workItem.contactId && (!workItem.conversationId || item.notes.includes(workItem.conversationId))).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0]
-    ?? crm.appointments.filter((item) => item.status === "tentative" && item.contactId === workItem.contactId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+  const appointment = appointmentForWorkItem(workItem, crm.appointments);
   if (!appointment) return reply.code(409).send({ error: "The tentative calendar hold linked to this request could not be found." });
+  if (appointment.status !== "tentative") {
+    const reconciled = await current.operations.updateWorkItem(id, {
+      appointmentId: appointment.id,
+      status: appointment.status === "cancelled" ? "closed" : "delivered",
+      nextStep: appointment.status === "cancelled" ? "Calendar hold was cancelled; no owner approval remains pending." : `Appointment is already ${appointment.status}.`,
+    });
+    return { workItem: reconciled, appointment };
+  }
   const confirmed = decision === "confirm";
   const updatedAppointment = await current.crm.updateAppointment(appointment.id, { status: confirmed ? "confirmed" : "cancelled" });
   const updatedWorkItem = await current.operations.updateWorkItem(id, {
@@ -344,6 +434,19 @@ app.post("/api/work-items/:id/decision", async (request, reply) => {
   return { workItem: updatedWorkItem, appointment: updatedAppointment };
 });
 app.get("/api/deliverables", async (request) => requireInternal(request).operations.listDeliverables());
+app.get("/api/admin/deliverables/:id/access-grants", async (request) => {
+  const { id } = request.params as { id: string };
+  return (await requireInternal(request).operations.accessGrantsFor(id)).map(({ id: grantId, issuedAt, revokedAt }) => ({ id: grantId, issuedAt, revokedAt }));
+});
+app.post("/api/admin/deliverables/:id/access-grants", async (request, reply) => {
+  const current = requireInternal(request); const { id } = request.params as { id: string }; const issued = await current.operations.issueAccessGrant(id);
+  return reply.code(201).send({ grant: { id: issued.grant.id, issuedAt: issued.grant.issuedAt, revokedAt: issued.grant.revokedAt }, accessUrl: `/api/public/deliverables/${id}?token=${encodeURIComponent(issued.token)}` });
+});
+app.delete("/api/admin/deliverables/:id/access-grants/:grantId", async (request) => {
+  const current = requireInternal(request); const { id, grantId } = request.params as { id: string; grantId: string };
+  const grant = await current.operations.revokeAccessGrant(id, grantId);
+  return { id: grant.id, issuedAt: grant.issuedAt, revokedAt: grant.revokedAt };
+});
 app.get("/api/quotes", async (request) => requireInternal(request).operations.listQuotes());
 app.get("/api/offers", async (request) => { requireInternal(request); return offers; });
 app.get("/api/projects", async (request) => requireInternal(request).operations.listProjects());
@@ -365,7 +468,12 @@ app.post("/api/crm/contacts", async (request, reply) => reply.code(201).send(awa
 app.post("/api/crm/leads", async (request, reply) => reply.code(201).send(await requireCrm(request).createLead(CrmLeadInputSchema.parse(request.body))));
 app.patch("/api/crm/leads/:id", async (request) => requireCrm(request).updateLead((request.params as { id: string }).id, request.body));
 app.post("/api/crm/appointments", async (request, reply) => reply.code(201).send(await requireCrm(request).createAppointment(CrmAppointmentInputSchema.parse(request.body))));
-app.patch("/api/crm/appointments/:id", async (request) => requireCrm(request).updateAppointment((request.params as { id: string }).id, request.body));
+app.patch("/api/crm/appointments/:id", async (request) => {
+  const current = requireInternal(request);
+  const appointment = await current.crm.updateAppointment((request.params as { id: string }).id, request.body);
+  await reconcileAppointmentWorkItems(current.crm, current.operations);
+  return appointment;
+});
 app.post("/api/crm/tasks", async (request, reply) => reply.code(201).send(await requireCrm(request).createTask(CrmTaskInputSchema.parse(request.body))));
 app.patch("/api/crm/tasks/:id", async (request) => requireCrm(request).updateTask((request.params as { id: string }).id, request.body));
 app.get("/api/crm/availability", async (request) => requireCrm(request).availability(String((request.query as { date?: string }).date ?? "")));

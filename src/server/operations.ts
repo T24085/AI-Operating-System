@@ -1,31 +1,32 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { nanoid } from "nanoid";
 import {
-  DeliverableSchema, ProjectSchema, QuoteSchema, WorkItemSchema,
-  type Deliverable, type EmployeeId, type Offer, type Project, type Quote, type QuoteLine, type WorkItem,
+  DeliverableAccessGrantSchema, DeliverableSchema, ProjectSchema, QuoteSchema, WorkItemSchema,
+  type Deliverable, type DeliverableAccessGrant, type EmployeeId, type Offer, type Project, type Quote, type QuoteLine, type WorkItem,
 } from "../shared/schemas.js";
 import { atomicWriteText } from "./paths.js";
+import type { RecordHealthRegistry } from "./reliability.js";
 
 type RecordType = WorkItem | Deliverable | Quote | Project;
 const now = () => new Date().toISOString();
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
-const meta = (value: RecordType & { accessTokenHash?: string }) => JSON.stringify(value).replace(/-->/g, "--\\>");
+const meta = (value: RecordType & { accessTokenHash?: string; accessGrants?: unknown[] }) => JSON.stringify({ ...value, schemaVersion: 1 }).replace(/-->/g, "--\\>");
 
 async function markdownFiles(dir: string): Promise<string[]> {
   try { return (await readdir(dir, { withFileTypes: true })).filter((item) => item.isFile() && item.name.endsWith(".md")).map((item) => join(dir, item.name)); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
 }
 
-function document(title: string, body: string, value: RecordType & { accessTokenHash?: string }): string {
-  return `---\nid: ${JSON.stringify(value.id)}\ntype: ${JSON.stringify(value.file.split("/")[1]?.replace(/s$/, "") ?? "record")}\ncreated_at: ${JSON.stringify(value.createdAt)}\n---\n\n# ${title}\n\n${body.trim()}\n\n<!-- OPS_META ${meta(value)} -->\n`;
+function document(title: string, body: string, value: RecordType & { accessTokenHash?: string; accessGrants?: unknown[] }): string {
+  return `---\nschema_version: 1\nid: ${JSON.stringify(value.id)}\ntype: ${JSON.stringify(value.file.split("/")[1]?.replace(/s$/, "") ?? "record")}\ncreated_at: ${JSON.stringify(value.createdAt)}\n---\n\n# ${title}\n\n${body.trim()}\n\n<!-- OPS_META ${meta(value)} -->\n`;
 }
 
 export interface PublishedDeliverable { deliverable: Deliverable; accessToken: string }
 
 export class OperationsStore {
-  constructor(readonly root: string) {}
+  constructor(readonly root: string, private readonly health?: RecordHealthRegistry) {}
 
   async initialize(): Promise<void> {
     for (const dir of ["work-items", "deliverables", "quotes", "projects"]) await mkdir(join(this.root, "shared", dir), { recursive: true });
@@ -93,7 +94,8 @@ export class OperationsStore {
     });
     const deliverable: Deliverable = { ...storedDeliverable, accessUrl: `/api/public/deliverables/${deliverableId}?token=${encodeURIComponent(token)}` };
     await atomicWriteText(this.root, contentFile, content);
-    await atomicWriteText(this.root, storedDeliverable.file, document(storedDeliverable.title, `- Status: delivered\n- Visibility: customer\n- Work item: ${workItem.id}\n- Content: ${contentFile}\n\n${storedDeliverable.preview}`, { ...storedDeliverable, accessTokenHash: hash(token) }));
+    const grant: DeliverableAccessGrant = { id: nanoid(12), tokenHash: hash(token), issuedAt: stamp, revokedAt: null };
+    await atomicWriteText(this.root, storedDeliverable.file, document(storedDeliverable.title, `- Status: delivered\n- Visibility: customer\n- Work item: ${workItem.id}\n- Content: ${contentFile}\n\n${storedDeliverable.preview}`, { ...storedDeliverable, accessGrants: [grant] }));
     await this.updateWorkItem(workItem.id, { status: "delivered", nextStep: "Confirm the customer’s preferred package and custom scope." });
     return { workItem: { ...workItem, status: "delivered", updatedAt: stamp, completedAt: stamp }, quote, published: { deliverable, accessToken: token } };
   }
@@ -110,19 +112,46 @@ export class OperationsStore {
     if (!/^[A-Za-z0-9_-]{8,40}$/.test(id) || token.length < 32) throw Object.assign(new Error("Deliverable not found."), { statusCode: 404 });
     const file = join(this.root, "shared", "deliverables", `${id}.md`); let text: string;
     try { text = await readFile(file, "utf8"); } catch { throw Object.assign(new Error("Deliverable not found."), { statusCode: 404 }); }
-    const parsed = this.parseWithSecret(text); const expected = Buffer.from(typeof parsed.accessTokenHash === "string" ? parsed.accessTokenHash : "", "hex"); const actual = Buffer.from(hash(token), "hex");
-    if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) throw Object.assign(new Error("Deliverable access is not valid."), { statusCode: 403 });
+    const parsed = this.parseWithSecret(text); const actual = Buffer.from(hash(token), "hex");
+    const valid = this.accessGrants(parsed).some((grant) => {
+      if (grant.revokedAt) return false;
+      const expected = Buffer.from(grant.tokenHash, "hex");
+      return expected.length === actual.length && timingSafeEqual(expected, actual);
+    });
+    if (!valid) throw Object.assign(new Error("Deliverable access is not valid."), { statusCode: 403 });
     const deliverable = DeliverableSchema.parse(parsed); if (deliverable.visibility !== "customer" || deliverable.status !== "delivered") throw Object.assign(new Error("Deliverable is not available."), { statusCode: 403 });
     return { deliverable, content: await readFile(join(this.root, deliverable.contentFile), "utf8") };
   }
 
   async reissueCustomerDeliverable(id: string): Promise<Deliverable> {
+    const issued = await this.issueAccessGrant(id);
+    return { ...issued.deliverable, accessUrl: `/api/public/deliverables/${issued.deliverable.id}?token=${encodeURIComponent(issued.token)}` };
+  }
+
+  async issueAccessGrant(id: string): Promise<{ deliverable: Deliverable; grant: DeliverableAccessGrant; token: string }> {
     const file = join(this.root, "shared", "deliverables", `${id}.md`); const text = await readFile(file, "utf8");
-    const deliverable = DeliverableSchema.parse(this.parseWithSecret(text));
+    const parsed = this.parseWithSecret(text); const deliverable = DeliverableSchema.parse(parsed);
     if (deliverable.visibility !== "customer" || deliverable.status !== "delivered") throw Object.assign(new Error("Deliverable is not available."), { statusCode: 403 });
-    const token = randomBytes(32).toString("base64url"); const updated = DeliverableSchema.parse({ ...deliverable, updatedAt: now() });
-    await atomicWriteText(this.root, file, document(updated.title, `- Status: delivered\n- Visibility: customer\n- Work item: ${updated.workItemId}\n- Content: ${updated.contentFile}\n\n${updated.preview}`, { ...updated, accessTokenHash: hash(token) }));
-    return { ...updated, accessUrl: `/api/public/deliverables/${updated.id}?token=${encodeURIComponent(token)}` };
+    const token = randomBytes(32).toString("base64url"); const stamp = now();
+    const grant = DeliverableAccessGrantSchema.parse({ id: nanoid(12), tokenHash: hash(token), issuedAt: stamp, revokedAt: null });
+    const updated = DeliverableSchema.parse({ ...deliverable, updatedAt: stamp });
+    await this.writeDeliverableWithGrants(file, updated, [...this.accessGrants(parsed), grant]);
+    return { deliverable: updated, grant, token };
+  }
+
+  async revokeAccessGrant(id: string, grantId: string): Promise<DeliverableAccessGrant> {
+    const file = join(this.root, "shared", "deliverables", `${id}.md`); const text = await readFile(file, "utf8");
+    const parsed = this.parseWithSecret(text); const deliverable = DeliverableSchema.parse(parsed); const grants = this.accessGrants(parsed);
+    const index = grants.findIndex((grant) => grant.id === grantId);
+    if (index < 0) throw Object.assign(new Error("Access grant not found."), { statusCode: 404 });
+    grants[index] = { ...grants[index], revokedAt: grants[index].revokedAt ?? now() };
+    await this.writeDeliverableWithGrants(file, DeliverableSchema.parse({ ...deliverable, updatedAt: now() }), grants);
+    return grants[index];
+  }
+
+  async accessGrantsFor(id: string): Promise<DeliverableAccessGrant[]> {
+    const text = await readFile(join(this.root, "shared", "deliverables", `${id}.md`), "utf8");
+    return this.accessGrants(this.parseWithSecret(text)).map((grant) => ({ ...grant, tokenHash: "0".repeat(64) }));
   }
 
   async customerDeliverablesForConversation(conversationId: string): Promise<Deliverable[]> {
@@ -136,12 +165,21 @@ export class OperationsStore {
   async listProjects(): Promise<Project[]> { return this.list("projects", ProjectSchema); }
 
   private parseWithSecret(text: string): Record<string, unknown> { const match = text.match(/<!-- OPS_META (\{.*\}) -->/); if (!match) throw new Error("Operations record is malformed."); return JSON.parse(match[1]) as Record<string, unknown>; }
+  private accessGrants(parsed: Record<string, unknown>): DeliverableAccessGrant[] {
+    const grants = Array.isArray(parsed.accessGrants) ? parsed.accessGrants.flatMap((grant) => { try { return [DeliverableAccessGrantSchema.parse(grant)]; } catch { return []; } }) : [];
+    if (grants.length || typeof parsed.accessTokenHash !== "string" || !/^[a-f0-9]{64}$/.test(parsed.accessTokenHash)) return grants;
+    const deliverable = DeliverableSchema.parse(parsed);
+    return [{ id: `legacy-${parsed.accessTokenHash.slice(0, 12)}`, tokenHash: parsed.accessTokenHash, issuedAt: deliverable.createdAt, revokedAt: null }];
+  }
+  private async writeDeliverableWithGrants(_file: string, deliverable: Deliverable, accessGrants: DeliverableAccessGrant[]): Promise<void> {
+    await atomicWriteText(this.root, deliverable.file, document(deliverable.title, `- Status: ${deliverable.status}\n- Visibility: ${deliverable.visibility}\n- Work item: ${deliverable.workItemId}\n- Content: ${deliverable.contentFile}\n\n${deliverable.preview}`, { ...deliverable, accessGrants }));
+  }
   private async get<T extends RecordType>(kind: string, id: string, schema: { parse(value: unknown): T }): Promise<T> {
     if (!/^[A-Za-z0-9_-]{8,40}$/.test(id)) throw Object.assign(new Error("Operations record not found."), { statusCode: 404 });
     const text = await readFile(join(this.root, "shared", kind, `${id}.md`), "utf8"); return schema.parse(this.parseWithSecret(text));
   }
   private async list<T extends RecordType>(kind: string, schema: { parse(value: unknown): T }, include: (name: string) => boolean = () => true): Promise<T[]> {
-    const result: T[] = []; for (const file of await markdownFiles(join(this.root, "shared", kind))) { if (!include(file)) continue; try { result.push(schema.parse(this.parseWithSecret(await readFile(file, "utf8")))); } catch { /* malformed records remain readable but are excluded */ } }
+    const result: T[] = []; for (const file of await markdownFiles(join(this.root, "shared", kind))) { if (!include(file)) continue; try { result.push(schema.parse(this.parseWithSecret(await readFile(file, "utf8")))); this.health?.clear(relative(this.root, file).split("\\").join("/")); } catch (error) { this.health?.report(relative(this.root, file).split("\\").join("/"), `operations:${kind}`, error); } }
     return result.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 }

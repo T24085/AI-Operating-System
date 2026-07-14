@@ -7,6 +7,7 @@ import {
   type CrmActivity, type CrmAppointment, type CrmContact, type CrmConversation, type CrmLead, type CrmTask, type PublicIntake,
 } from "../shared/schemas.js";
 import { atomicWriteText } from "./paths.js";
+import type { RecordHealthRegistry } from "./reliability.js";
 
 type Kind = "contacts" | "leads" | "appointments" | "tasks" | "activities";
 type RecordValue = CrmContact | CrmLead | CrmAppointment | CrmTask | CrmActivity;
@@ -20,7 +21,7 @@ function markdown(kind: Kind, value: RecordValue): string {
     .filter(([key]) => !["id", "createdAt", "updatedAt", "notes", "summary", "detail"].includes(key))
     .map(([key, item]) => `- ${key.replace(/[A-Z]/g, (letter) => ` ${letter.toLowerCase()}`)}: ${Array.isArray(item) ? item.join(", ") : item ?? "—"}`);
   const narrative = "notes" in value ? value.notes : "summary" in value ? value.summary : "";
-  return `---\nid: ${JSON.stringify(value.id)}\ntype: ${JSON.stringify(kind.slice(0, -1))}\ncreated_at: ${JSON.stringify(value.createdAt)}\n---\n\n# ${title}\n\n${lines.join("\n")}\n\n## Notes\n\n${narrative || "No notes yet."}\n\n<!-- CRM_META ${esc(value)} -->\n`;
+  return `---\nschema_version: 1\nid: ${JSON.stringify(value.id)}\ntype: ${JSON.stringify(kind.slice(0, -1))}\ncreated_at: ${JSON.stringify(value.createdAt)}\n---\n\n# ${title}\n\n${lines.join("\n")}\n\n## Notes\n\n${narrative || "No notes yet."}\n\n<!-- CRM_META ${esc({ ...value, schemaVersion: 1 })} -->\n`;
 }
 
 async function files(dir: string): Promise<string[]> {
@@ -40,7 +41,7 @@ async function markdownTree(dir: string): Promise<string[]> {
 }
 
 export class CrmStore {
-  constructor(readonly root: string, private readonly options: { demo?: boolean } = {}) {}
+  constructor(readonly root: string, private readonly options: { demo?: boolean; health?: RecordHealthRegistry } = {}) {}
 
   async initialize(): Promise<void> {
     for (const dir of ["contacts", "leads", "appointments", "tasks", "activities"]) await mkdir(join(this.root, "crm", dir), { recursive: true });
@@ -149,7 +150,9 @@ export class CrmStore {
     const result: T[] = [];
     for (const file of await files(join(this.root, "crm", kind))) {
       const match = (await readFile(file, "utf8")).match(/<!-- CRM_META (\{.*\}) -->/);
-      if (match) try { result.push(schema.parse(JSON.parse(match[1]))); } catch { /* readable malformed records are excluded */ }
+      if (match) try { result.push(schema.parse(JSON.parse(match[1]))); this.options.health?.clear(relative(this.root, file).split("\\").join("/")); }
+      catch (error) { this.options.health?.report(relative(this.root, file).split("\\").join("/"), `crm:${kind}`, error); }
+      else this.options.health?.report(relative(this.root, file).split("\\").join("/"), `crm:${kind}`, new Error("Missing CRM_META metadata."));
     }
     return result;
   }

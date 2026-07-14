@@ -23,7 +23,11 @@ import type {
   Project,
   Quote,
   WorkItem,
+  BackupManifest,
+  DiagnosticsResponse,
 } from "../shared/schemas";
+
+export interface DeliverableGrantSummary { id: string; issuedAt: string; revokedAt: string | null }
 
 export interface CrmData { contacts: CrmContact[]; leads: CrmLead[]; appointments: CrmAppointment[]; tasks: CrmTask[]; conversations: CrmConversation[]; activities: CrmActivity[]; workItems: WorkItem[]; deliverables: Deliverable[]; quotes: Quote[]; projects: Project[] }
 
@@ -41,9 +45,10 @@ export interface BootstrapData {
 let csrfToken = "";
 
 async function json<T>(url: string, init?: RequestInit): Promise<T> {
+  const hasBody = init?.body !== undefined && init.body !== null;
   const response = await fetch(url, {
     ...init,
-    headers: { "Content-Type": "application/json", ...(csrfToken && init?.method && init.method !== "GET" ? { "X-CSRF-Token": csrfToken } : {}), ...(init?.headers ?? {}) },
+    headers: { ...(hasBody ? { "Content-Type": "application/json" } : {}), ...(csrfToken && init?.method && init.method !== "GET" ? { "X-CSRF-Token": csrfToken } : {}), ...(init?.headers ?? {}) },
   });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error ?? `Request failed with ${response.status}.`);
@@ -67,6 +72,11 @@ export const api = {
   file: (path: string) => json<{ path: string; content: string }>(`/api/file?path=${encodeURIComponent(path)}`),
   openFolder: () => json<{ ok: boolean }>("/api/open-folder", { method: "POST" }),
   backup: () => json<{ ok: true; path: string }>("/api/admin/backup", { method: "POST" }),
+  diagnostics: () => json<DiagnosticsResponse>("/api/admin/diagnostics"),
+  reindex: () => json<{ ok: true; indexFreshAt: string }>("/api/admin/reindex", { method: "POST" }),
+  backups: () => json<BackupManifest[]>("/api/admin/backups"),
+  createBackup: () => json<BackupManifest>("/api/admin/backups", { method: "POST" }),
+  restoreBackup: (id: string, confirmation: string) => json<{ ok: true; backup: BackupManifest; indexFreshAt: string }>(`/api/admin/backups/${encodeURIComponent(id)}/restore`, { method: "POST", body: JSON.stringify({ confirmation }) }),
   crmAuth: async () => { const result = await json<{ configured: boolean; authenticated: boolean; csrfToken?: string }>("/api/crm/auth"); csrfToken = result.csrfToken ?? ""; return result; },
   crmSetup: async (password: string) => { const result = await json<{ ok: true; csrfToken: string }>("/api/crm/auth/setup", { method: "POST", body: JSON.stringify({ password }) }); csrfToken = result.csrfToken; return result; },
   crmLogin: async (password: string) => { const result = await json<{ ok: true; csrfToken: string }>("/api/crm/auth/login", { method: "POST", body: JSON.stringify({ password }) }); csrfToken = result.csrfToken; return result; },
@@ -85,6 +95,9 @@ export const api = {
   updateWorkItem: (id: string, input: Partial<WorkItem>) => json<WorkItem>(`/api/work-items/${id}`, { method: "PATCH", body: JSON.stringify(input) }),
   decideAppointmentWorkItem: (id: string, decision: "confirm" | "decline") => json<{ workItem: WorkItem; appointment: CrmAppointment }>(`/api/work-items/${id}/decision`, { method: "POST", body: JSON.stringify({ decision }) }),
   deliverables: () => json<Deliverable[]>("/api/deliverables"),
+  deliverableGrants: (id: string) => json<DeliverableGrantSummary[]>(`/api/admin/deliverables/${encodeURIComponent(id)}/access-grants`),
+  issueDeliverableGrant: (id: string) => json<{ grant: DeliverableGrantSummary; accessUrl: string }>(`/api/admin/deliverables/${encodeURIComponent(id)}/access-grants`, { method: "POST" }),
+  revokeDeliverableGrant: (id: string, grantId: string) => json<DeliverableGrantSummary>(`/api/admin/deliverables/${encodeURIComponent(id)}/access-grants/${encodeURIComponent(grantId)}`, { method: "DELETE" }),
   quotes: () => json<Quote[]>("/api/quotes"),
   offers: () => json<Offer[]>("/api/offers"),
   projects: () => json<Project[]>("/api/projects"),

@@ -10,8 +10,9 @@ type Message = PublicConversationMessage & {
 type JoiningSpecialist = { employeeId: EmployeeId; name: string; avatar: string };
 type RememberedConversation = { conversationId: string; resumeToken: string; title: string; updatedAt: string };
 type RememberedVisitor = Pick<PublicIntake, "name" | "email" | "phone"> & { conversations: RememberedConversation[] };
+type PublicIntakeForm = Omit<PublicIntake, "consent"> & { consent: boolean };
 
-const emptyIntake: PublicIntake = { name: "", email: "", phone: "", need: "", consent: true };
+const emptyIntake: PublicIntakeForm = { name: "", email: "", phone: "", need: "", consent: false };
 const rememberedVisitorKey = "samuel-studio:concierge-visitor:v1";
 
 function loadRememberedVisitor(): RememberedVisitor | null {
@@ -52,8 +53,8 @@ export function PublicConcierge({ onOwner }: { onOwner: () => void }) {
   const initialVisitor = useRef(loadRememberedVisitor()).current;
   const [rememberedVisitor, setRememberedVisitor] = useState<RememberedVisitor | null>(initialVisitor);
   const [editingVisitor, setEditingVisitor] = useState(!initialVisitor);
-  const [rememberOnDevice, setRememberOnDevice] = useState(true);
-  const [intake, setIntake] = useState<PublicIntake>(() => initialVisitor
+  const [rememberOnDevice, setRememberOnDevice] = useState(Boolean(initialVisitor));
+  const [intake, setIntake] = useState<PublicIntakeForm>(() => initialVisitor
     ? { name: initialVisitor.name, email: initialVisitor.email, phone: initialVisitor.phone, need: "", consent: true }
     : emptyIntake);
   const [conversationId, setConversationId] = useState<string | null>(null);
@@ -185,10 +186,12 @@ export function PublicConcierge({ onOwner }: { onOwner: () => void }) {
 
   const begin = async (event: FormEvent) => {
     event.preventDefault();
+    if (!intake.consent) return;
     setBusy(true);
     setError(null);
     try {
-      const result = await api.publicIntake(intake);
+      const submitted: PublicIntake = { ...intake, consent: true };
+      const result = await api.publicIntake(submitted);
       if (rememberOnDevice) {
         const previous = rememberedVisitor?.email.toLowerCase() === intake.email.trim().toLowerCase()
           ? rememberedVisitor.conversations
@@ -229,7 +232,7 @@ export function PublicConcierge({ onOwner }: { onOwner: () => void }) {
     storeRememberedVisitor(null);
     setRememberedVisitor(null);
     setEditingVisitor(true);
-    setRememberOnDevice(true);
+    setRememberOnDevice(false);
     setIntake({ ...emptyIntake, need: intake.need });
   };
 
@@ -259,7 +262,8 @@ export function PublicConcierge({ onOwner }: { onOwner: () => void }) {
               <div>{rememberedVisitor.conversations.slice(0, 3).map((conversation) => <button type="button" key={conversation.conversationId} disabled={busy} onClick={() => void resumeConversation(conversation)}><span><strong>{conversation.title}</strong><small>{conversationDate(conversation.updatedAt)}</small></span><PiArrowRight /></button>)}</div>
             </section>}
             <label><span><PiSparkle /> What can we help with today?</span><textarea autoFocus required value={intake.need} onChange={(event) => setIntake({ ...intake, need: event.target.value })} placeholder="Tell us about the project, question, or idea…" /></label>
-            {error && <div className="public-error"><PiWarning />{error}</div>}
+            {error && <div className="public-error" role="alert"><PiWarning />{error}</div>}
+            <span className="sr-only" aria-live="polite">{busy ? "Opening your saved conversation." : ""}</span>
             <button className="public-start" disabled={busy}>{busy ? <PiCircleNotch className="spin" /> : <>Start a new conversation <PiArrowRight /></>}</button>
             <button className="public-forget" type="button" onClick={forgetVisitor}>Forget me on this device</button>
           </form>
@@ -270,9 +274,10 @@ export function PublicConcierge({ onOwner }: { onOwner: () => void }) {
             <label><span><PiEnvelope /> Email</span><input required type="email" autoComplete="email" value={intake.email} onChange={(event) => setIntake({ ...intake, email: event.target.value })} placeholder="you@company.com" /></label>
             <label><span><PiPhone /> Phone <i>optional</i></span><input autoComplete="tel" value={intake.phone} onChange={(event) => setIntake({ ...intake, phone: event.target.value })} placeholder="Phone or WhatsApp" /></label>
             <label><span><PiSparkle /> What can we help with?</span><textarea required value={intake.need} onChange={(event) => setIntake({ ...intake, need: event.target.value })} placeholder="Tell us about the project, question, or idea…" /></label>
-            <label className="public-consent"><input type="checkbox" checked={intake.consent} onChange={(event) => setIntake({ ...intake, consent: event.target.checked as true })} /><span><i><PiCheck /></i>I agree that Samuel Studio may store this conversation and contact me about this inquiry.</span></label>
+            <label className="public-consent"><input type="checkbox" checked={intake.consent} onChange={(event) => setIntake({ ...intake, consent: event.target.checked })} /><span><i><PiCheck /></i>I agree that Samuel Studio may store this conversation and contact me about this inquiry.</span></label>
             <label className="public-remember"><input type="checkbox" checked={rememberOnDevice} onChange={(event) => setRememberOnDevice(event.target.checked)} /><span>Remember my contact details on this device</span></label>
-            {error && <div className="public-error"><PiWarning />{error}</div>}
+            {error && <div className="public-error" role="alert"><PiWarning />{error}</div>}
+            <span className="sr-only" aria-live="polite">{busy ? "Starting your private conversation." : ""}</span>
             <button className="public-start" disabled={busy || !intake.consent}>{busy ? <PiCircleNotch className="spin" /> : <>{rememberedVisitor ? "Save and continue" : "Meet your Receptionist"} <PiArrowRight /></>}</button>
           </form>
         </>}
