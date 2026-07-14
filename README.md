@@ -2,6 +2,24 @@
 
 A local-first business desktop where ten role-specific AI employees use Ollama for practical knowledge work. Every visible conversation, proposed action, owner decision, result, and failure is written to human-readable Markdown. SQLite FTS5 is used only as a rebuildable search index.
 
+## Screenshots
+
+### Public concierge
+
+![Samuel Studio public concierge with the Receptionist and a joined specialist](design-reference/public-specialist-join-1440.png)
+
+### AI employee workspace
+
+![Internal AI employee workspace with conversation history](design-reference/internal-agent-history-1440.png)
+
+### Private CRM and calendar
+
+![Private Samuel Studio CRM desktop](design-reference/crm-desktop.png)
+
+### Employee soul and operating plan
+
+![Sales employee soul and operating plan](design-reference/sales-soul-plan-1440.png)
+
 ## What is included
 
 - Ten distinct employees: Receptionist, Sales, Accounting, Marketing, Developer, Designer, Bookkeeper, Research, Social Media, and Customer Service
