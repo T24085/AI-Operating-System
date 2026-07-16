@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentRuntime } from "../src/server/agent.js";
+import { CampaignOperationsStore } from "../src/server/campaign-operations.js";
 import { parseEmployeeConversation } from "../src/server/employee-conversations.js";
 import { RecordsIndex } from "../src/server/indexer.js";
 import { readSafeText } from "../src/server/paths.js";
@@ -38,9 +39,11 @@ async function harness() {
   }));
   const index = new RecordsIndex(records);
   await index.start();
-  const tools = new SafeToolRuntime(records, index);
+  const campaigns = new CampaignOperationsStore(root);
+  await campaigns.initialize();
+  const tools = new SafeToolRuntime(records, index, undefined, undefined, undefined, undefined, campaigns);
   const runtime = new AgentRuntime(records, tools, SettingsSchema.parse({}));
-  return { root, records, index, tools, runtime };
+  return { root, records, index, tools, runtime, campaigns };
 }
 
 afterEach(async () => {
@@ -83,10 +86,56 @@ describe("agent runtime with deterministic Ollama responses", () => {
     (runtime as unknown as { client: { chat: typeof chat } }).client = { chat };
     const events: AgentEvent[] = [];
     await runtime.send(conversation.id, "Please prepare a proposal.", (event) => events.push(event));
+    expect(chat.mock.calls[0][0].messages[0].content).toContain("shared/employee-files/sales/");
     expect(events.at(-1)).toMatchObject({ type: "done", content: expect.stringContaining("not created a tracked deliverable") });
     expect(await readSafeText(records.root, conversation.file)).not.toContain("ready shortly");
     await index.close();
   });
+
+  it("redirects Research from future promises into sourced work and proposes a durable report", async () => {
+    const { records, index, tools, runtime } = await harness();
+    const research = employeeById.get("research")!;
+    const conversation = await records.createConversation("research", "Local business prospects", "gemma4:12b");
+    await runtime.startConversation(conversation, research);
+    vi.spyOn(tools, "executeReadOnly").mockResolvedValue({ ok: true, tool: "web_search", output: "1. Example Chamber listing\nhttps://example.com/directory\nLocal business directory result." });
+    const chat = vi.fn()
+      .mockResolvedValueOnce(await stream({ message: { content: "I'll research that and prepare a report shortly." } }))
+      .mockResolvedValueOnce(await stream({ message: { content: "", tool_calls: [{ id: "search-1", function: { name: "web_search", arguments: { query: "local businesses without standalone websites Chicago" } } }] } }))
+      .mockResolvedValueOnce(await stream({ message: { content: "## Findings\n\nI found one prospect candidate in the directory. Verify website status before outreach.\n\nSource: https://example.com/directory\nAccessed: 2026-07-15" } }));
+    (runtime as unknown as { client: { chat: typeof chat } }).client = { chat };
+    const events: AgentEvent[] = [];
+    await runtime.send(conversation.id, "Find local businesses that may not have websites.", (event) => events.push(event));
+    const action = events.find((event): event is Extract<AgentEvent, { type: "action_proposed" }> => event.type === "action_proposed")?.action;
+    expect(action?.tool).toBe("create_file");
+    expect(action?.targetPaths[0]).toMatch(/^employees\/research\/artifacts\/research-\d+\.md$/);
+    expect(action?.preview).toContain("https://example.com/directory");
+    expect(events.at(-1)).toMatchObject({ type: "done", content: expect.stringContaining("## Findings") });
+    const transcript = await readSafeText(records.root, conversation.file);
+    expect(transcript).not.toContain("prepare a report shortly");
+    expect(transcript).toContain("Research report proposed");
+    await index.close();
+  });
+
+  it("forces a sourced Research synthesis instead of failing at the tool-step boundary", async () => {
+    const { records, index, tools, runtime } = await harness();
+    const research = employeeById.get("research")!;
+    const conversation = await records.createConversation("research", "Bounded local research", "gemma4:12b");
+    await runtime.startConversation(conversation, research);
+    vi.spyOn(tools, "executeReadOnly").mockResolvedValue({ ok: true, tool: "web_search", output: "Candidate evidence\nhttps://example.com/source" });
+    const responses = Array.from({ length: 13 }, (_, index) => stream({ message: { content: "", tool_calls: [{ id: `search-${index}`, function: { name: "web_search", arguments: { query: `candidate ${index}` } } }] } }));
+    responses.push(stream({ message: { content: "## Findings\n\nTwo candidates remain worth manual verification.\n\nSource: https://example.com/source" } }));
+    const chat = vi.fn().mockImplementation(async (request: { tools?: unknown[] }) => {
+      if (responses.length === 1) expect(request.tools).toEqual([]);
+      return await responses.shift()!;
+    });
+    (runtime as unknown as { client: { chat: typeof chat } }).client = { chat };
+    const events: AgentEvent[] = [];
+    await runtime.send(conversation.id, "Find a couple of local website prospects.", (event) => events.push(event));
+    expect(chat).toHaveBeenCalledTimes(14);
+    expect(events.at(-1)).toMatchObject({ type: "done", content: expect.stringContaining("Two candidates") });
+    expect(events.some((event) => event.type === "error")).toBe(false);
+    await index.close();
+  }, 20_000);
 
   it("pauses for approval, then resumes with the execution result", async () => {
     const { root, records, index, tools, runtime } = await harness();
@@ -95,7 +144,7 @@ describe("agent runtime with deterministic Ollama responses", () => {
     await runtime.startConversation(conversation, receptionist);
     const chat = vi.fn()
       .mockResolvedValueOnce(await stream({ message: { content: "", tool_calls: [{ id: "call-1", function: { name: "create_file", arguments: { path: "employees/receptionist/artifacts/callback.md", content: "# Callback", reason: "Capture the request." } } }] } }))
-      .mockResolvedValueOnce(await stream({ message: { content: "The callback request is saved." } }));
+      .mockResolvedValueOnce(await stream({ message: { content: "The callback request is still pending owner approval." } }));
     (runtime as unknown as { client: { chat: typeof chat } }).client = { chat };
     const events: AgentEvent[] = [];
     await runtime.send(conversation.id, "Save a callback request.", (event) => events.push(event));
@@ -105,8 +154,39 @@ describe("agent runtime with deterministic Ollama responses", () => {
     const result = await tools.execute(proposed!);
     proposed!.status = "completed";
     const resumed = await runtime.resume(proposed!, result);
-    expect(resumed).toBe("The callback request is saved.");
+    expect(resumed).toContain("Completed Create callback.md");
+    expect(resumed).not.toContain("still pending");
+    expect(chat).toHaveBeenCalledTimes(1);
     expect(await readSafeText(root, proposed!.targetPaths[0])).toBe("# Callback");
+    await index.close();
+  });
+
+  it("turns a Marketing campaign response into one canonical campaign and content-calendar proposal", async () => {
+    const { records, index, tools, runtime, campaigns } = await harness();
+    const marketing = employeeById.get("marketing")!;
+    const conversation = await records.createConversation("marketing", "Studio launch", "gemma4:12b");
+    await runtime.startConversation(conversation, marketing);
+    const chat = vi.fn()
+      .mockResolvedValueOnce(await stream({ message: { content: "## The Art of Presence\n\nLaunch Samuel Studio with a four-week editorial campaign." } }))
+      .mockResolvedValueOnce(await stream({ message: { content: "", tool_calls: [{ id: "campaign-1", function: { name: "create_campaign", arguments: {
+        title: "The Art of Presence", objective: "Launch Samuel Studio with a four-week editorial campaign.", audience: "Creative founders and premium portrait clients", offer: "Studio portraiture and digital experiences", channels: ["Instagram"], callToAction: "Explore Samuel Studio",
+        messageHierarchy: ["Presence is felt, not merely seen."], proof: ["Samuel Studio portfolio"], posts: [{ platform: "Instagram", objective: "Launch awareness", copy: "Presence is felt.", callToAction: "Explore Samuel Studio", altText: "Samuel Studio launch title card" }], reason: "Save the owner-requested launch plan in Campaign Operations."
+      } } }] } }));
+    (runtime as unknown as { client: { chat: typeof chat } }).client = { chat };
+    const events: AgentEvent[] = [];
+    await runtime.send(conversation.id, "Come up with a marketing campaign plan for our studio launch.", (event) => events.push(event));
+    const proposed = events.find((event): event is Extract<AgentEvent, { type: "action_proposed" }> => event.type === "action_proposed")?.action;
+    expect(proposed?.tool).toBe("create_campaign");
+    expect(proposed?.arguments.posts).toHaveLength(1);
+    expect(chat.mock.calls[1][0].messages.some((message: { content?: string }) => message.content?.includes("This is a campaign request"))).toBe(true);
+    const result = await tools.execute(proposed!);
+    expect(result).toContain("1 content-calendar draft");
+    const campaign = (await campaigns.listCampaigns())[0];
+    expect(campaign.title).toBe("The Art of Presence");
+    expect(await campaigns.listPosts(campaign.id)).toHaveLength(1);
+    await tools.execute(proposed!);
+    expect(await campaigns.listCampaigns()).toHaveLength(1);
+    expect(await campaigns.listPosts(campaign.id)).toHaveLength(1);
     await index.close();
   });
 

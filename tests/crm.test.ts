@@ -8,6 +8,8 @@ import { PublicReceptionistRuntime, routeQuestion } from "../src/server/public-r
 import { OperationsStore } from "../src/server/operations.js";
 import { issuePublicResumeToken, parsePublicConversation, verifyPublicResumeToken } from "../src/server/public-resume.js";
 import { WorkspaceRecords } from "../src/server/records.js";
+import { ServiceCaseStore } from "../src/server/service-cases.js";
+import { SalesQualificationStore } from "../src/server/sales-qualifications.js";
 import { OnboardingInputSchema, PublicIntakeSchema, SettingsSchema, type PublicAgentEvent } from "../src/shared/schemas.js";
 
 const cleanup: string[] = [];
@@ -69,7 +71,7 @@ describe("public Receptionist boundary", () => {
   it("keeps internal financial questions behind the Receptionist boundary without calling a model", async () => {
     const workspace = await root(); const records = new WorkspaceRecords(workspace);
     await records.initialize(OnboardingInputSchema.parse({ companyName: "Samuel Studio", ownerName: "Samuel", industry: "Creative studio", description: "A photography, design, and digital creative studio.", services: "Photography and digital experiences", hours: "Monday to Friday", policies: "Private financial records stay internal.", tone: "Warm and clear", goals: "Serve clients well", currency: "USD", timezone: "America/Chicago" }));
-    const crm = new CrmStore(workspace); const runtime = new PublicReceptionistRuntime(records, crm, new OperationsStore(workspace), SettingsSchema.parse({}));
+    const crm = new CrmStore(workspace); const runtime = new PublicReceptionistRuntime(records, crm, new OperationsStore(workspace), new ServiceCaseStore(workspace), SettingsSchema.parse({}));
     const intake = PublicIntakeSchema.parse({ name: "Maya Chen", email: "maya@example.com", phone: "", need: "I have a question.", consent: true });
     const conversation = await records.createConversation("receptionist", "Public inquiry", "missing-model");
     await records.appendConversation(conversation.id, "CRM linkage", "Linked to CRM.", { type: "crm_linkage", contactId: "contact-1", leadId: "lead-1", customerName: intake.name, customerEmail: intake.email, initialNeed: intake.need });
@@ -83,7 +85,7 @@ describe("public Receptionist boundary", () => {
   it("brings the routed specialist into the visible customer chat with a distinct recorded message", async () => {
     const workspace = await root(); const records = new WorkspaceRecords(workspace);
     await records.initialize(OnboardingInputSchema.parse({ companyName: "Samuel Studio", ownerName: "Samuel", industry: "Creative studio", description: "A photography, design, and digital creative studio.", services: "Photography and digital experiences", hours: "Monday to Friday", policies: "Owner approval required.", tone: "Warm and clear", goals: "Serve clients well", currency: "USD", timezone: "America/Chicago" }));
-    const crm = new CrmStore(workspace); const runtime = new PublicReceptionistRuntime(records, crm, new OperationsStore(workspace), SettingsSchema.parse({}));
+    const crm = new CrmStore(workspace); const qualifications = new SalesQualificationStore(workspace); const runtime = new PublicReceptionistRuntime(records, crm, new OperationsStore(workspace), new ServiceCaseStore(workspace), qualifications, SettingsSchema.parse({}));
     const intake = PublicIntakeSchema.parse({ name: "Maya Chen", email: "maya@example.com", phone: "", need: "I need the right package for my business.", consent: true });
     const conversation = await records.createConversation("receptionist", "Public inquiry", "gemma4:12b");
     await records.appendConversation(conversation.id, "CRM linkage", "Linked to CRM.", { type: "crm_linkage", contactId: "contact-1", leadId: "lead-1", customerName: intake.name, customerEmail: intake.email, initialNeed: intake.need });
@@ -100,6 +102,24 @@ describe("public Receptionist boundary", () => {
     const markdown = await readFile(join(workspace, conversation.file), "utf8");
     expect(markdown).toContain("## Sales Specialist"); expect(markdown).toContain("public_specialist_message");
     const tracked = await crm.publicConversations(); expect(tracked[0].messageCount).toBe(3); expect(tracked[0].departments).toContain("Sales");
+    const created = await qualifications.list(); expect(created).toHaveLength(1); expect(created[0]).toEqual(expect.objectContaining({ conversationId: conversation.id, leadId: "lead-1" }));
+    expect(events).toContainEqual(expect.objectContaining({ type: "sales_progress_created", salesProgress: expect.objectContaining({ id: created[0].id }) }));
+  });
+
+  it("automatically opens one owner-attention case when support routing detects a refund concern", async () => {
+    const workspace = await root(); const records = new WorkspaceRecords(workspace);
+    await records.initialize(OnboardingInputSchema.parse({ companyName: "Samuel Studio", ownerName: "Samuel", industry: "Creative studio", description: "A photography, design, and digital creative studio.", services: "Photography and digital experiences", hours: "Monday to Friday", policies: "Refunds require owner approval.", tone: "Warm and clear", goals: "Serve clients well", currency: "USD", timezone: "America/Chicago" }));
+    const crm = new CrmStore(workspace); const serviceCases = new ServiceCaseStore(workspace); const runtime = new PublicReceptionistRuntime(records, crm, new OperationsStore(workspace), serviceCases, SettingsSchema.parse({}));
+    const intake = PublicIntakeSchema.parse({ name: "Maya Chen", email: "maya@example.com", phone: "", need: "I need help with an existing project.", consent: true });
+    const conversation = await records.createConversation("receptionist", "Public support", "gemma4:12b");
+    await records.appendConversation(conversation.id, "CRM linkage", "Linked to CRM.", { type: "crm_linkage", contactId: "contact-1", leadId: "lead-1", customerName: intake.name, customerEmail: intake.email, initialNeed: intake.need });
+    await runtime.start(conversation, intake, { contactId: "contact-1", leadId: "lead-1" });
+    const chat = vi.fn().mockResolvedValueOnce({ message: { content: "I’m the Customer Service specialist. I’ve documented the concern without promising a refund." } }).mockResolvedValueOnce(await stream({ message: { content: "Your request is recorded for owner review." } }));
+    (runtime as unknown as { client: { chat: typeof chat } }).client = { chat };
+    const events: PublicAgentEvent[] = []; await runtime.send(conversation.id, "I have a complaint and want a refund.", (event) => events.push(event));
+    const cases = await serviceCases.list(); expect(cases).toHaveLength(1); expect(cases[0]).toEqual(expect.objectContaining({ status: "awaiting_owner", priority: "high", conversationId: conversation.id }));
+    expect(events).toContainEqual(expect.objectContaining({ type: "service_case_created", serviceCase: expect.objectContaining({ id: cases[0].id, statusLabel: "Owner review" }) }));
+    await runtime.send(conversation.id, "What is the status of the refund request?", () => undefined); expect(await serviceCases.list()).toHaveLength(1);
   });
 
   it("resumes a browser-authorized conversation after restart with its visible history", async () => {
@@ -119,7 +139,7 @@ describe("public Receptionist boundary", () => {
 
     const crm = new CrmStore(workspace); const linked = await crm.createPublicInquiry(intake);
     const restartedRecords = new WorkspaceRecords(workspace); const activated = await restartedRecords.activateConversation(conversation.id);
-    const runtime = new PublicReceptionistRuntime(restartedRecords, crm, new OperationsStore(workspace), SettingsSchema.parse({}));
+    const runtime = new PublicReceptionistRuntime(restartedRecords, crm, new OperationsStore(workspace), new ServiceCaseStore(workspace), SettingsSchema.parse({}));
     await runtime.resume(activated.record, restored.intake, restored.messages, { contactId: linked.contact.id, leadId: linked.lead.id });
     const chat = vi.fn()
       .mockResolvedValueOnce({ message: { content: "I remember Puppy Wash. The booking requirement is already part of the estimate." } })
@@ -138,7 +158,7 @@ describe("public Receptionist boundary", () => {
     const intake = PublicIntakeSchema.parse({ name: "Ed Christoffersen", email: "ed@example.com", phone: "", need: "Puppy Wash needs a professional website with all services, a booking system, a custom logo in blue and red, and domain guidance.", consent: true });
     const linked = await crm.createPublicInquiry(intake); const conversation = await records.createConversation("receptionist", "Puppy Wash", "gemma4:12b");
     await records.appendConversation(conversation.id, "CRM linkage", "Linked to CRM.", { type: "crm_linkage", contactId: linked.contact.id, leadId: linked.lead.id, customerName: intake.name, customerEmail: intake.email, initialNeed: intake.need });
-    const runtime = new PublicReceptionistRuntime(records, crm, operations, SettingsSchema.parse({})); await runtime.start(conversation, intake, { contactId: linked.contact.id, leadId: linked.lead.id });
+    const runtime = new PublicReceptionistRuntime(records, crm, operations, new ServiceCaseStore(workspace), SettingsSchema.parse({})); await runtime.start(conversation, intake, { contactId: linked.contact.id, leadId: linked.lead.id });
     const chat = vi.fn()
       .mockResolvedValueOnce({ message: { content: "Sales recommends the Professional Website and Booking System published packages." } })
       .mockResolvedValueOnce({ message: { content: "Developer confirms the site and scheduling scope are technically compatible." } })
@@ -163,7 +183,7 @@ describe("public Receptionist boundary", () => {
     const intake = PublicIntakeSchema.parse({ name: "Ed Example", email: "ed@example.com", phone: "", need: "I want to schedule a consultation.", consent: true });
     const linked = await crm.createPublicInquiry(intake); const conversation = await records.createConversation("receptionist", "Appointment", "gemma4:latest");
     await records.appendConversation(conversation.id, "CRM linkage", "Linked to CRM.", { type: "crm_linkage", contactId: linked.contact.id, leadId: linked.lead.id, customerName: intake.name, customerEmail: intake.email, initialNeed: intake.need });
-    const runtime = new PublicReceptionistRuntime(records, crm, operations, SettingsSchema.parse({})); await runtime.start(conversation, intake, { contactId: linked.contact.id, leadId: linked.lead.id });
+    const runtime = new PublicReceptionistRuntime(records, crm, operations, new ServiceCaseStore(workspace), SettingsSchema.parse({})); await runtime.start(conversation, intake, { contactId: linked.contact.id, leadId: linked.lead.id });
     const target = new Date(); target.setDate(target.getDate() + 1); while ([0, 6].includes(target.getDay())) target.setDate(target.getDate() + 1); target.setHours(10, 0, 0, 0);
     const month = new Intl.DateTimeFormat("en-US", { month: "long" }).format(target); const request = `${month} ${target.getDate()}th 10am`;
     const events: PublicAgentEvent[] = []; await runtime.send(conversation.id, request, (event) => events.push(event));

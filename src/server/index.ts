@@ -3,12 +3,17 @@ import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, rename, rm, stat } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { join } from "node:path";
+import { basename, extname, join } from "node:path";
 import { employees, employeeById } from "../shared/employees.js";
 import {
   ActionDecisionSchema,
+  CampaignAssetPatchSchema,
+  CampaignCreateSchema,
+  CampaignPatchSchema,
+  CampaignPostInputSchema,
+  CampaignPostPatchSchema,
   CrmAppointmentInputSchema,
   CrmContactInputSchema,
   CrmLeadInputSchema,
@@ -19,6 +24,11 @@ import {
   OnboardingInputSchema,
   PublicIntakeSchema,
   PublicResumeInputSchema,
+  ResearchPlaceInputSchema,
+  SalesQualificationCreateSchema,
+  SalesQualificationPatchSchema,
+  ServiceCaseCreateSchema,
+  ServiceCasePatchSchema,
   SettingsSchema,
   WorkItemStatusSchema,
 } from "../shared/schemas.js";
@@ -26,7 +36,7 @@ import { offers } from "../shared/offers.js";
 import { AgentRuntime } from "./agent.js";
 import { ConfigStore, type AppConfig } from "./config.js";
 import { RecordsIndex } from "./indexer.js";
-import { readSafeText } from "./paths.js";
+import { readSafeText, resolveSafePath } from "./paths.js";
 import { WorkspaceRecords } from "./records.js";
 import { SafeToolRuntime } from "./tools.js";
 import { CrmAuth, cookieValue } from "./crm-auth.js";
@@ -37,6 +47,13 @@ import { parseEmployeeConversation } from "./employee-conversations.js";
 import { OperationsStore } from "./operations.js";
 import { BackupManager, RecordHealthRegistry } from "./reliability.js";
 import { BoundedRateLimiter } from "./rate-limit.js";
+import { parseLedgerCsv } from "./ledger.js";
+import { storeEmployeeFile } from "./employee-files.js";
+import { ResearchMapStore } from "./research-map.js";
+import { geocodePublicPlace } from "./web-research.js";
+import { buildFrontDesk, ServiceCaseStore } from "./service-cases.js";
+import { SalesQualificationStore } from "./sales-qualifications.js";
+import { CampaignOperationsStore } from "./campaign-operations.js";
 
 interface Services {
   config: AppConfig;
@@ -49,6 +66,10 @@ interface Services {
   operations: OperationsStore;
   health: RecordHealthRegistry;
   backups: BackupManager;
+  researchMap: ResearchMapStore;
+  serviceCases: ServiceCaseStore;
+  salesQualifications: SalesQualificationStore;
+  campaigns: CampaignOperationsStore;
 }
 
 function appointmentForWorkItem(
@@ -77,12 +98,13 @@ async function reconcileAppointmentWorkItems(crm: CrmStore, operations: Operatio
   }
 }
 
-const app = Fastify({ logger: true, bodyLimit: 1_100_000, trustProxy: process.env.AIOS_TRUST_PROXY === "loopback" ? "loopback" : false });
+const app = Fastify({ logger: true, bodyLimit: 10_500_000, trustProxy: process.env.AIOS_TRUST_PROXY === "loopback" ? "loopback" : false });
+app.addContentTypeParser("application/octet-stream", { parseAs: "buffer", bodyLimit: 10_000_000 }, (_request, body, done) => done(null, body));
 await app.register(cors, { origin: ["http://127.0.0.1:5173", "http://localhost:5173"] });
 app.addHook("onRequest", async (_request, reply) => {
   reply.header("X-Content-Type-Options", "nosniff"); reply.header("X-Frame-Options", "DENY");
   reply.header("Referrer-Policy", "strict-origin-when-cross-origin"); reply.header("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
-  reply.header("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' http://127.0.0.1:4317; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
+  reply.header("Content-Security-Policy", "default-src 'self'; img-src 'self' data: https://*.tile.openstreetmap.org; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' http://127.0.0.1:4317; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
 });
 
 const configStore = new ConfigStore();
@@ -119,16 +141,23 @@ async function createServices(config: AppConfig): Promise<Services> {
   await records.loadActions();
   const index = new RecordsIndex(records);
   await index.start();
-  const tools = new SafeToolRuntime(records, index);
-  const agents = new AgentRuntime(records, tools, config.settings);
+  const serviceCases = new ServiceCaseStore(records.root, health);
+  await serviceCases.initialize();
+  const salesQualifications = new SalesQualificationStore(records.root, health);
+  await salesQualifications.initialize();
+  const campaigns = new CampaignOperationsStore(records.root, health);
+  await campaigns.initialize();
   const crm = new CrmStore(records.root, { health });
   await crm.initialize();
   const operations = new OperationsStore(records.root, health);
   await operations.initialize();
+  const tools = new SafeToolRuntime(records, index, serviceCases, salesQualifications, operations, crm, campaigns);
+  const agents = new AgentRuntime(records, tools, config.settings);
   await reconcileAppointmentWorkItems(crm, operations);
-  const publicReceptionist = new PublicReceptionistRuntime(records, crm, operations, config.settings);
+  const publicReceptionist = new PublicReceptionistRuntime(records, crm, operations, serviceCases, salesQualifications, config.settings);
   const backups = new BackupManager(configStore.root, config);
-  return { config, records, index, tools, agents, crm, publicReceptionist, operations, health, backups };
+  const researchMap = new ResearchMapStore(records.root);
+  return { config, records, index, tools, agents, crm, publicReceptionist, operations, health, backups, researchMap, serviceCases, salesQualifications, campaigns };
 }
 
 const existing = await configStore.read();
@@ -265,33 +294,114 @@ app.post("/api/actions/:id/decision", async (request, reply) => {
   const decision = ActionDecisionSchema.parse(request.body);
   const action = current.records.actions.get(id);
   if (!action) return reply.code(404).send({ error: "Action not found." });
-  if (action.status !== "pending") return reply.code(409).send({ error: `Action is already ${action.status}.` });
+  const resumableApprovedAction = action.status === "approved" && ["propose_case_reply", "propose_sales_qualification_update", "deliver_sales_proposal", "create_campaign", "approve_campaign_package"].includes(action.tool) && decision.decision === "approve";
+  if (action.status !== "pending" && !resumableApprovedAction) return reply.code(409).send({ error: `Action is already ${action.status}.` });
   if (decision.contentHash !== action.contentHash) return reply.code(409).send({ error: "Approval hash does not match the current proposal." });
 
   if (decision.decision === "deny") {
     await current.records.appendActionEvent(id, "denied", decision.note || "Owner denied this action.");
-    const assistantMessage = await current.agents.resume(action, `The owner denied this action.${decision.note ? ` Note: ${decision.note}` : ""}`);
+    let assistantMessage: string | null = null;
+    try { assistantMessage = await current.agents.resume(action, `The owner denied this action.${decision.note ? ` Note: ${decision.note}` : ""}`); }
+    catch { assistantMessage = "The action was denied. The employee follow-up response was interrupted, but the decision is recorded."; }
     return { action, assistantMessage };
   }
 
-  await current.records.appendActionEvent(id, "approved", decision.note || "Owner approved this action.");
+  if (!resumableApprovedAction) await current.records.appendActionEvent(id, "approved", decision.note || "Owner approved this action.");
+  let result: string;
   try {
-    const result = await current.tools.execute(action);
+    result = await current.tools.execute(action);
     await current.records.appendActionEvent(id, "completed", result);
-    const assistantMessage = await current.agents.resume(action, result);
-    return { action, assistantMessage };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Action execution failed.";
     const status = message.includes("changed after") ? "stale" : "failed";
     await current.records.appendActionEvent(id, status, message);
     return reply.code(409).send({ error: message, action });
   }
+  // Execution is authoritative. A slow or interrupted model follow-up must
+  // never turn a completed filesystem action into a failure.
+  let assistantMessage: string | null = null;
+  try { assistantMessage = await current.agents.resume(action, result); }
+  catch { assistantMessage = "The approved action completed successfully. The employee follow-up response was interrupted, but no work was lost."; }
+  return { action, assistantMessage };
 });
 
 app.get("/api/search", async (request) => {
   const current = requireInternal(request);
   const { q = "" } = request.query as { q?: string };
   return current.index.search(q);
+});
+
+app.get("/api/finance/ledger", async (request) => {
+  const current = requireInternal(request);
+  const source = "company/finance/transactions.csv";
+  const target = await resolveSafePath(current.records.root, source);
+  const [content, sourceStat] = await Promise.all([readSafeText(current.records.root, source), stat(target)]);
+  return parseLedgerCsv(content, current.config.company.currency, sourceStat.mtime.toISOString());
+});
+
+app.get("/api/research/places", async (request) => requireInternal(request).researchMap.list());
+
+app.post("/api/research/places", async (request, reply) => {
+  const current = requireInternal(request);
+  return reply.code(201).send(await current.researchMap.save(ResearchPlaceInputSchema.parse(request.body)));
+});
+
+app.get("/api/research/geocode", async (request) => {
+  requireInternal(request);
+  const query = String((request.query as { q?: string }).q ?? "");
+  return geocodePublicPlace(query);
+});
+
+app.get("/api/employee-files/:id", async (request) => {
+  const current = requireInternal(request);
+  const id = EmployeeIdSchema.parse((request.params as { id: string }).id);
+  const base = `shared/employee-files/${id}`;
+  const directory = await resolveSafePath(current.records.root, base);
+  let entries;
+  try { entries = await readdir(directory, { withFileTypes: true }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+  const names = new Set(entries.filter((entry) => entry.isFile()).map((entry) => entry.name));
+  const visible = entries.filter((entry) => {
+    if (!entry.isFile() || entry.name.toLowerCase().endsWith(".agent.md")) return false;
+    if (!entry.name.toLowerCase().endsWith(".md")) return true;
+    const stem = entry.name.slice(0, -3).toLowerCase();
+    return ![...names].some((name) => !name.toLowerCase().endsWith(".md") && name.slice(0, -extname(name).length).toLowerCase() === stem);
+  });
+  return Promise.all(visible.map(async (entry) => {
+    const path = `${base}/${entry.name}`;
+    const details = await stat(await resolveSafePath(current.records.root, path));
+    const extension = extname(entry.name).slice(1).toUpperCase() || "FILE";
+    const stem = entry.name.slice(0, -extname(entry.name).length);
+    const agentReadable = entry.name.toLowerCase().endsWith(".md") || names.has(`${stem}.md`) || names.has(`${stem}.agent.md`);
+    return { name: basename(entry.name, extname(entry.name)).replaceAll("_", " "), path, kind: extension, size: details.size, modifiedAt: details.mtime.toISOString(), agentReadable };
+  }));
+});
+
+app.post("/api/employee-files/:id/upload", async (request, reply) => {
+  const current = requireInternal(request);
+  const id = EmployeeIdSchema.parse((request.params as { id: string }).id);
+  const name = String((request.query as { name?: string }).name ?? "");
+  const body = request.body;
+  if (!Buffer.isBuffer(body)) return reply.code(400).send({ error: "The employee upload body is invalid." });
+  const stored = await storeEmployeeFile(current.records.root, id, name, body);
+  return reply.code(201).send(stored);
+});
+
+app.get("/api/employee-files/:id/open", async (request, reply) => {
+  const current = requireInternal(request);
+  const id = EmployeeIdSchema.parse((request.params as { id: string }).id);
+  const { path, download } = request.query as { path?: string; download?: string };
+  const base = `shared/employee-files/${id}/`;
+  if (!path?.startsWith(base)) return reply.code(403).send({ error: "This file is outside the employee library." });
+  const target = await resolveSafePath(current.records.root, path);
+  const details = await stat(target);
+  if (!details.isFile() || details.size > 25_000_000) return reply.code(400).send({ error: "This employee file cannot be opened." });
+  const extension = extname(path).toLowerCase();
+  const contentTypes: Record<string, string> = { ".pdf": "application/pdf", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".csv": "text/csv; charset=utf-8", ".txt": "text/plain; charset=utf-8", ".md": "text/markdown; charset=utf-8", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg" };
+  reply.header("Content-Type", contentTypes[extension] ?? "application/octet-stream");
+  reply.header("Content-Disposition", `${download === "1" ? "attachment" : "inline"}; filename="${basename(path).replace(/["\r\n]/g, "")}"`);
+  reply.header("Cache-Control", "private, no-store");
+  return reply.send(await readFile(target));
 });
 
 app.get("/api/models", async (request, reply) => {
@@ -349,6 +459,71 @@ app.get("/api/admin/diagnostics", async (request) => {
     pendingWorkItems: workItems.filter((item) => !["delivered", "closed"].includes(item.status)).length,
   };
 });
+app.get("/api/admin/front-desk", async (request) => {
+  const current = requireInternal(request);
+  const [crm, workItems, serviceCases, qualifications] = await Promise.all([current.crm.bootstrap(), current.operations.listWorkItems(), current.serviceCases.list(), current.salesQualifications.list()]);
+  return buildFrontDesk({ conversations: crm.conversations, contacts: crm.contacts, appointments: crm.appointments, workItems, cases: serviceCases, qualifications });
+});
+app.get("/api/admin/service-cases", async (request) => requireInternal(request).serviceCases.list());
+app.get("/api/admin/service-cases/:id", async (request) => requireInternal(request).serviceCases.get((request.params as { id: string }).id));
+app.post("/api/admin/service-cases", async (request, reply) => {
+  const current = requireInternal(request); const input = ServiceCaseCreateSchema.parse(request.body); const crm = await current.crm.bootstrap();
+  const conversation = crm.conversations.find((item) => item.id === input.conversationId);
+  if (!conversation) return reply.code(404).send({ error: "The linked customer conversation was not found." });
+  if (conversation.contactId !== input.contactId || (input.leadId && conversation.leadId !== input.leadId)) return reply.code(400).send({ error: "The case links do not match the customer conversation." });
+  return reply.code(201).send(await current.serviceCases.create(input));
+});
+app.patch("/api/admin/service-cases/:id", async (request) => {
+  const current = requireInternal(request); const patch = ServiceCasePatchSchema.parse(request.body);
+  return current.serviceCases.update((request.params as { id: string }).id, patch, "owner");
+});
+app.get("/api/admin/sales-operations", async (request) => requireInternal(request).salesQualifications.operations());
+app.get("/api/admin/sales-qualifications", async (request) => requireInternal(request).salesQualifications.list());
+app.get("/api/admin/sales-qualifications/:id", async (request) => requireInternal(request).salesQualifications.get((request.params as { id: string }).id));
+app.post("/api/admin/sales-qualifications", async (request, reply) => {
+  const current = requireInternal(request); const input = SalesQualificationCreateSchema.parse(request.body); const crm = await current.crm.bootstrap();
+  const lead = crm.leads.find((item) => item.id === input.leadId); if (!lead) return reply.code(404).send({ error: "The linked CRM lead was not found." });
+  if (lead.contactId !== input.contactId) return reply.code(400).send({ error: "The qualification contact does not match the CRM lead." });
+  if (input.conversationId) { const conversation = crm.conversations.find((item) => item.id === input.conversationId); if (!conversation || conversation.leadId !== input.leadId) return reply.code(400).send({ error: "The qualification conversation does not match the CRM lead." }); }
+  return reply.code(201).send(await current.salesQualifications.create(input));
+});
+app.patch("/api/admin/sales-qualifications/:id", async (request) => {
+  const current = requireInternal(request); return current.salesQualifications.update((request.params as { id: string }).id, SalesQualificationPatchSchema.parse(request.body), "owner");
+});
+app.get("/api/admin/campaign-operations", async (request) => requireInternal(request).campaigns.operations());
+app.get("/api/admin/campaigns", async (request) => requireInternal(request).campaigns.listCampaigns());
+app.get("/api/admin/campaigns/:id", async (request) => requireInternal(request).campaigns.getCampaign((request.params as { id: string }).id));
+app.post("/api/admin/campaigns", async (request, reply) => reply.code(201).send(await requireInternal(request).campaigns.createCampaign(CampaignCreateSchema.parse(request.body))));
+app.patch("/api/admin/campaigns/:id", async (request) => requireInternal(request).campaigns.updateCampaign((request.params as { id: string }).id, CampaignPatchSchema.parse(request.body), "owner"));
+app.get("/api/admin/campaigns/:id/posts", async (request) => requireInternal(request).campaigns.listPosts((request.params as { id: string }).id));
+app.post("/api/admin/campaigns/:id/posts", async (request, reply) => reply.code(201).send(await requireInternal(request).campaigns.createPost((request.params as { id: string }).id, CampaignPostInputSchema.parse(request.body))));
+app.patch("/api/admin/campaigns/:id/posts/:postId", async (request) => {
+  const { id, postId } = request.params as { id: string; postId: string }; return requireInternal(request).campaigns.updatePost(id, postId, CampaignPostPatchSchema.parse(request.body), "owner");
+});
+app.get("/api/admin/campaigns/:id/assets", async (request) => requireInternal(request).campaigns.listAssets((request.params as { id: string }).id));
+app.post("/api/admin/campaigns/:id/assets", async (request, reply) => {
+  const body = request.body; if (!Buffer.isBuffer(body)) return reply.code(400).send({ error: "The campaign asset upload body is invalid." });
+  const { name } = request.query as { name?: string }; return reply.code(201).send(await requireInternal(request).campaigns.storeAsset((request.params as { id: string }).id, String(name ?? ""), body));
+});
+app.patch("/api/admin/campaigns/:id/assets/:assetId", async (request) => {
+  const { id, assetId } = request.params as { id: string; assetId: string }; return requireInternal(request).campaigns.updateAsset(id, assetId, CampaignAssetPatchSchema.parse(request.body));
+});
+app.get("/api/admin/campaign-files", async (request) => requireInternal(request).campaigns.listFiles((request.query as { campaignId?: string }).campaignId));
+app.post("/api/admin/campaign-files/upload", async (request, reply) => {
+  const body = request.body; if (!Buffer.isBuffer(body)) return reply.code(400).send({ error: "The campaign PDF upload body is invalid." });
+  const query = request.query as { campaignId?: string; name?: string; kind?: string; provenance?: string };
+  const kinds = new Set(["campaign_brief", "content_calendar", "external_brief", "media_plan", "report", "other"]);
+  if (!query.campaignId || !kinds.has(String(query.kind))) return reply.code(400).send({ error: "Campaign and document kind are required." });
+  return reply.code(201).send(await requireInternal(request).campaigns.uploadCampaignPdf(query.campaignId, String(query.name ?? ""), query.kind as Parameters<CampaignOperationsStore["uploadCampaignPdf"]>[2], String(query.provenance ?? ""), body));
+});
+app.get("/api/admin/campaign-files/:id/open", async (request, reply) => {
+  const { record, content } = await requireInternal(request).campaigns.readFileRecord((request.params as { id: string }).id); const download = (request.query as { download?: string }).download === "1";
+  reply.type("application/pdf").header("Content-Disposition", `${download ? "attachment" : "inline"}; filename="${basename(record.name).replace(/["\r\n]/g, "")}"`).send(content);
+});
+app.get("/api/admin/campaign-packages/:id/download", async (request, reply) => {
+  const { record, content } = await requireInternal(request).campaigns.readPackage((request.params as { id: string }).id);
+  reply.type("application/zip").header("Content-Disposition", `attachment; filename="campaign-package-${record.campaignId}-v${record.version}.zip"`).send(content);
+});
 app.post("/api/admin/reindex", async (request) => {
   const current = requireInternal(request); await current.index.rebuild();
   return { ok: true, indexFreshAt: current.index.freshness() };
@@ -395,8 +570,8 @@ app.post("/api/crm/auth/logout", async (request, reply) => {
 });
 app.get("/api/crm/bootstrap", async (request) => {
   const current = requireInternal(request);
-  const [crm, workItems, deliverables, quotes, projects] = await Promise.all([current.crm.bootstrap(), current.operations.listWorkItems(), current.operations.listDeliverables(), current.operations.listQuotes(), current.operations.listProjects()]);
-  return { ...crm, workItems, deliverables, quotes, projects };
+  const [crm, workItems, deliverables, quotes, projects, serviceCases, salesQualifications, campaigns] = await Promise.all([current.crm.bootstrap(), current.operations.listWorkItems(), current.operations.listDeliverables(), current.operations.listQuotes(), current.operations.listProjects(), current.serviceCases.list(), current.salesQualifications.list(), current.campaigns.listCampaigns()]);
+  return { ...crm, workItems, deliverables, quotes, projects, serviceCases, salesQualifications, campaigns };
 });
 app.get("/api/work-items", async (request) => requireInternal(request).operations.listWorkItems());
 app.patch("/api/work-items/:id", async (request) => {
@@ -502,7 +677,9 @@ app.post("/api/public/conversations/:id/resume", async (request, reply) => {
   const restored = parsePublicConversation(activated.content);
   await current.publicReceptionist.resume(activated.record, restored.intake, restored.messages, { contactId: restored.contactId, leadId: restored.leadId });
   const deliverables = await current.operations.customerDeliverablesForConversation(id);
-  return { conversationId: id, intake: restored.intake, messages: restored.messages, deliverables, lastActivity: restored.lastActivity };
+  const serviceCases = await current.serviceCases.publicForConversation(id);
+  const salesProgress = await current.salesQualifications.publicForConversation(id);
+  return { conversationId: id, intake: restored.intake, messages: restored.messages, deliverables, serviceCases, salesProgress, lastActivity: restored.lastActivity };
 });
 
 app.get("/api/public/deliverables/:id", async (request, reply) => {
@@ -553,6 +730,8 @@ app.setErrorHandler((error, _request, reply) => {
   const status = appError.statusCode ?? (appError.name === "ZodError" ? 400 : 500);
   reply.code(status).send({ error: appError.message });
 });
+
+app.get("/sw.js", async (_request, reply) => reply.header("Cache-Control", "no-store").code(410).send());
 
 const dist = join(process.cwd(), "dist");
 if (existsSync(dist)) {

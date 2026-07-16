@@ -3,6 +3,7 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     environment: "node",
+    fileParallelism: false,
     include: ["tests/**/*.test.{ts,tsx}"],
     exclude: ["tests/live-ollama.test.ts"],
     coverage: {

@@ -6,6 +6,8 @@ import { AGENT_SOUL_VERSION } from "../shared/agent-souls.js";
 import type { WorkspaceRecords } from "./records.js";
 import type { CrmStore } from "./crm.js";
 import type { OperationsStore } from "./operations.js";
+import type { ServiceCaseStore } from "./service-cases.js";
+import { SalesQualificationStore } from "./sales-qualifications.js";
 
 interface PublicSession {
   record: ConversationRecord;
@@ -62,8 +64,13 @@ async function withTimeout<T>(operation: Promise<T>, milliseconds: number, label
 export class PublicReceptionistRuntime {
   private client = new Ollama({ host: process.env.OLLAMA_HOST ?? "http://127.0.0.1:11434" });
   private sessions = new Map<string, PublicSession>();
+  private salesQualifications: SalesQualificationStore;
+  private settings: Settings;
 
-  constructor(private records: WorkspaceRecords, private crm: CrmStore, private operations: OperationsStore, private settings: Settings) {}
+  constructor(private records: WorkspaceRecords, private crm: CrmStore, private operations: OperationsStore, private serviceCases: ServiceCaseStore, salesQualificationsOrSettings: SalesQualificationStore | Settings, settings?: Settings) {
+    this.salesQualifications = settings ? salesQualificationsOrSettings as SalesQualificationStore : new SalesQualificationStore(records.root);
+    this.settings = settings ?? salesQualificationsOrSettings as Settings;
+  }
 
   updateSettings(settings: Settings): void { this.settings = settings; }
 
@@ -116,6 +123,20 @@ RULES
 
     const decision = routeQuestion(`${session.intake.need}\n${content}`);
     await this.records.appendConversation(conversationId, "Routing decision", decision.reason, { type: "route_decision", ...decision });
+    if (decision.departments.includes("customer-service")) {
+      const serviceCase = await this.serviceCases.createFromRouting({ contactId: session.contactId, leadId: session.leadId, conversationId, customerName: session.intake.name, content });
+      const currentConversation = await this.records.activateConversation(conversationId, "receptionist");
+      if (!currentConversation.content.includes(`\"caseId\":${JSON.stringify(serviceCase.id)}`)) await this.records.appendConversation(conversationId, "Service case", `Customer Service case ${serviceCase.id} is ${serviceCase.status.replaceAll("_", " ")}.`, { type: "public_service_case", caseId: serviceCase.id, status: serviceCase.status });
+      const [publicCase] = await this.serviceCases.publicForConversation(conversationId);
+      if (publicCase) emit({ type: "service_case_created", serviceCase: publicCase });
+    }
+    if (decision.departments.includes("sales")) {
+      const qualification = await this.salesQualifications.createFromRouting({ contactId: session.contactId, leadId: session.leadId, conversationId, customerName: session.intake.name, content: `${session.intake.need}\n${content}` });
+      const currentConversation = await this.records.activateConversation(conversationId, "receptionist");
+      if (!currentConversation.content.includes(`\"qualificationId\":${JSON.stringify(qualification.id)}`)) await this.records.appendConversation(conversationId, "Sales qualification", `Sales qualification ${qualification.id} is ${qualification.readiness.replaceAll("_", " ")}.`, { type: "public_sales_progress", qualificationId: qualification.id, readiness: qualification.readiness });
+      const [progress] = await this.salesQualifications.publicForConversation(conversationId);
+      if (progress) emit({ type: "sales_progress_created", salesProgress: progress });
+    }
     if (decision.privacyBoundary === "private") {
       const response = "I can help with Samuel Studio services and projects, but I can’t access or discuss private accounting or company financial information. If your question is about a project invoice or payment you received, tell me the project name and I’ll prepare a message for the team.";
       session.messages.push({ role: "assistant", content: response });

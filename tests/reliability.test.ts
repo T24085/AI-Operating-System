@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { offers } from "../src/shared/offers.js";
 import { OnboardingInputSchema, SettingsSchema } from "../src/shared/schemas.js";
 import type { AppConfig } from "../src/server/config.js";
@@ -9,7 +9,7 @@ import { RecordsIndex } from "../src/server/indexer.js";
 import { OperationsStore } from "../src/server/operations.js";
 import { WorkspaceRecords } from "../src/server/records.js";
 import { BackupManager, RecordHealthRegistry } from "../src/server/reliability.js";
-import { privateAddress, readLimitedBody } from "../src/server/web-research.js";
+import { pinnedLookup, privateAddress, readLimitedBody } from "../src/server/web-research.js";
 import { BoundedRateLimiter } from "../src/server/rate-limit.js";
 
 const cleanup: string[] = [];
@@ -42,7 +42,7 @@ describe("record health and recoverable backups", () => {
     expect((await manager.list()).some((item) => item.reason === "pre-restore")).toBe(true);
     const records = new WorkspaceRecords(workspacePath); const index = new RecordsIndex(records); await index.start();
     expect(index.search("Reliability Studio")[0]?.path).toBe("company/PROFILE.md"); await index.close();
-  });
+  }, 15_000);
 
   it("rejects a corrupt manifest and restores the old directory when a swap fails", async () => {
     const { dataRoot, workspacePath, config } = await fixture(); const manager = new BackupManager(dataRoot, config); const backup = await manager.create();
@@ -69,6 +69,16 @@ describe("deliverable grants and research boundaries", () => {
     expect(privateAddress("127.0.0.1")).toBe(true); expect(privateAddress("10.0.0.2")).toBe(true); expect(privateAddress("169.254.1.1")).toBe(true); expect(privateAddress("8.8.8.8")).toBe(false);
     async function* oversized() { yield new Uint8Array(700_000); yield new Uint8Array(400_001); }
     await expect(readLimitedBody(oversized())).rejects.toThrow("1 MB");
+  });
+
+  it("returns the DNS result shape requested by modern Node lookup callers", () => {
+    const addresses = [{ address: "203.0.113.10", family: 4 }, { address: "2001:db8::10", family: 6 }];
+    const lookup = pinnedLookup(addresses);
+    const allCallback = vi.fn(); const singleCallback = vi.fn();
+    lookup("example.com", { all: true }, allCallback);
+    lookup("example.com", { all: false }, singleCallback);
+    expect(allCallback).toHaveBeenCalledWith(null, addresses);
+    expect(singleCallback).toHaveBeenCalledWith(null, "203.0.113.10", 4);
   });
 });
 

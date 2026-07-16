@@ -16,4 +16,11 @@ describe("chat layout regression contract", () => {
     expect(shortViewport).toContain(".employee-window { min-height: 0; }");
     expect(shortViewport).toContain(".employee-dock { bottom: 12px; height: 110px;");
   });
+
+  it("refreshes the Research Map when a map approval changes status", async () => {
+    const source = await readFile(new URL("../src/client/App.tsx", import.meta.url), "utf8");
+    expect(source).toContain('action.tool === "map_research_place"');
+    expect(source).toContain("function ResearchMapView({ refreshToken }");
+    expect(source).toContain("[load, refreshToken]");
+  });
 });
