@@ -117,6 +117,8 @@ describe("append-only records and rebuildable search", () => {
     expect(await readSafeText(root, "employees/sales/SOUL.md")).toContain("exact verified intake, booking, contact, or PayPal URL");
     expect(await readSafeText(root, "employees/accounting/PLAN.md")).toContain("finance README");
     expect(await readSafeText(root, "company/SERVICES.md")).toContain("https://www.paypal.com/ncp/payment/TS4B6ND3JD9RQ");
+    expect(await readSafeText(root, "shared/employee-files/sales/Samuel_Studio_Employee_Sales_Guide.md")).toContain("Employee Sales Guide");
+    expect((await readFile(join(root, "shared/employee-files/sales/Samuel_Studio_Employee_Sales_Guide.pdf"))).subarray(0, 4).toString()).toBe("%PDF");
   });
 
   it("restricts public-web research to the Research employee and blocks local targets", async () => {

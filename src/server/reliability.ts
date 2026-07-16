@@ -4,6 +4,11 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import {
   ActionProposalSchema,
   BackupManifestSchema,
+  CampaignAssetSchema,
+  CampaignFileSchema,
+  CampaignPackageSchema,
+  CampaignPostSchema,
+  CampaignSchema,
   CrmActivitySchema,
   CrmAppointmentSchema,
   CrmContactSchema,
@@ -12,7 +17,12 @@ import {
   DeliverableAccessGrantSchema,
   DeliverableSchema,
   ProjectSchema,
+  ProposalSchema,
   QuoteSchema,
+  ServiceCaseEventSchema,
+  ServiceCaseSchema,
+  SalesQualificationEventSchema,
+  SalesQualificationSchema,
   WorkItemSchema,
   type BackupManifest,
   type RecordHealthIssue,
@@ -65,7 +75,9 @@ export class RecordHealthRegistry {
   list(): RecordHealthIssue[] { return [...this.issues.values()].sort((a, b) => a.path.localeCompare(b.path)); }
 
   async scan(workspaceRoot: string): Promise<RecordHealthIssue[]> {
+    const retained = [...this.issues.values()].filter((issue) => issue.recordKind === "campaign-file-extraction");
     this.issues.clear();
+    retained.forEach((issue) => this.issues.set(issue.path, issue));
     const files = (await walk(workspaceRoot)).filter((file) => file.endsWith(".md"));
     for (const file of files) {
       const path = normalized(workspaceRoot, file);
@@ -73,15 +85,35 @@ export class RecordHealthRegistry {
       try {
         const text = await readFile(file, "utf8");
         const version = schemaVersion(text);
-        const crm = path.match(/^crm\/(contacts|leads|appointments|tasks|activities)\//);
-        const ops = path.match(/^shared\/(work-items|deliverables|quotes|projects)\//);
+        const crm = path.match(/^crm\/(contacts|leads|appointments|tasks|activities|service-cases|sales-qualifications)\//);
+        const ops = path.match(/^shared\/(work-items|deliverables|quotes|projects|proposals)\//);
+        const campaign = path.match(/^shared\/(campaigns|campaign-posts|campaign-assets\/records|campaign-files\/records|campaign-packages)\//);
         if (crm) {
           kind = `crm:${crm[1]}`;
-          const schema = { contacts: CrmContactSchema, leads: CrmLeadSchema, appointments: CrmAppointmentSchema, tasks: CrmTaskSchema, activities: CrmActivitySchema }[crm[1]];
-          schema!.parse(embeddedJson(text, "CRM_META"));
+          if (crm[1] === "service-cases") {
+            ServiceCaseSchema.parse(embeddedJson(text, "SERVICE_CASE_META"));
+            for (const match of text.matchAll(/<!-- CASE_EVENT (\{.*\}) -->/g)) ServiceCaseEventSchema.parse(JSON.parse(match[1]));
+          } else if (crm[1] === "sales-qualifications") {
+            SalesQualificationSchema.parse(embeddedJson(text, "SALES_QUALIFICATION_META"));
+            for (const match of text.matchAll(/<!-- SALES_QUALIFICATION_EVENT (\{.*\}) -->/g)) SalesQualificationEventSchema.parse(JSON.parse(match[1]));
+          } else {
+            const schema = { contacts: CrmContactSchema, leads: CrmLeadSchema, appointments: CrmAppointmentSchema, tasks: CrmTaskSchema, activities: CrmActivitySchema }[crm[1]];
+            schema!.parse(embeddedJson(text, "CRM_META"));
+          }
+        } else if (campaign && !path.endsWith("/.keep.md") && !path.endsWith(".manifest.json")) {
+          kind = `campaign:${campaign[1]}`;
+          const definitions = {
+            campaigns: ["CAMPAIGN_META", CampaignSchema],
+            "campaign-posts": ["CAMPAIGN_POST_META", CampaignPostSchema],
+            "campaign-assets/records": ["CAMPAIGN_ASSET_META", CampaignAssetSchema],
+            "campaign-files/records": ["CAMPAIGN_FILE_META", CampaignFileSchema],
+            "campaign-packages": ["CAMPAIGN_PACKAGE_META", CampaignPackageSchema],
+          } as const;
+          const definition = definitions[campaign[1] as keyof typeof definitions];
+          definition[1].parse(embeddedJson(text, definition[0]));
         } else if (ops && !path.endsWith("-content.md")) {
           kind = `operations:${ops[1]}`;
-          const schema = { "work-items": WorkItemSchema, deliverables: DeliverableSchema, quotes: QuoteSchema, projects: ProjectSchema }[ops[1]];
+          const schema = { "work-items": WorkItemSchema, deliverables: DeliverableSchema, quotes: QuoteSchema, projects: ProjectSchema, proposals: ProposalSchema }[ops[1]];
           const metadata = embeddedJson(text, "OPS_META") as Record<string, unknown>;
           schema!.parse(metadata);
           if (ops[1] === "deliverables" && Array.isArray(metadata.accessGrants)) metadata.accessGrants.forEach((grant) => DeliverableAccessGrantSchema.parse(grant));

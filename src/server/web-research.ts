@@ -1,9 +1,26 @@
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { Agent, fetch } from "undici";
+import { GeocodeResultSchema, type GeocodeResult } from "../shared/schemas.js";
 
 const MAX_RESPONSE_BYTES = 1_000_000;
 const USER_AGENT = "SamuelStudioResearch/1.0 (local owner-operated research assistant)";
+type PublicAddress = { address: string; family: number };
+
+export function pinnedLookup(addresses: PublicAddress[]) {
+  let cursor = 0;
+  return (_hostname: string, options: unknown, callback: (...args: any[]) => void): void => {
+    // Modern Node versions request every candidate address with `{ all: true }`.
+    // Returning the older single-address callback shape makes Node reject an
+    // undefined address before the HTTPS request ever leaves this computer.
+    if (options && typeof options === "object" && "all" in options && (options as { all?: boolean }).all) {
+      callback(null, addresses.map(({ address, family }) => ({ address, family })));
+      return;
+    }
+    const selected = addresses[cursor++ % addresses.length];
+    callback(null, selected.address, selected.family);
+  };
+}
 
 export function privateAddress(address: string): boolean {
   const normalized = address.toLowerCase().replace(/^::ffff:/, "");
@@ -60,15 +77,11 @@ function textFromHtml(html: string): string {
 async function publicFetch(input: string): Promise<{ url: string; contentType: string; text: string }> {
   let target = await validatePublicUrl(input);
   for (let redirect = 0; redirect < 5; redirect += 1) {
-    let cursor = 0;
-    const dispatcher = new Agent({ connect: { lookup: (_hostname, _options, callback) => {
-      const selected = target.addresses[cursor++ % target.addresses.length];
-      callback(null, selected.address, selected.family as 4 | 6);
-    } } });
+    const dispatcher = new Agent({ connect: { lookup: pinnedLookup(target.addresses) } });
     try {
       const response = await fetch(target.url, {
         dispatcher, redirect: "manual", signal: AbortSignal.timeout(15_000),
-        headers: { "User-Agent": USER_AGENT, Accept: "text/html,text/plain,application/xhtml+xml;q=0.9,*/*;q=0.1" },
+        headers: { "User-Agent": USER_AGENT, Accept: "text/html,text/plain,application/xhtml+xml,application/json;q=0.9,*/*;q=0.1" },
       });
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get("location");
@@ -81,7 +94,7 @@ async function publicFetch(input: string): Promise<{ url: string; contentType: s
       const length = Number(response.headers.get("content-length") ?? 0);
       if (length > MAX_RESPONSE_BYTES) { await response.body?.cancel(); throw new Error("Research page is larger than the 1 MB safety limit."); }
       const contentType = response.headers.get("content-type") ?? "";
-      if (!/text\/(html|plain)|application\/xhtml\+xml/i.test(contentType)) { await response.body?.cancel(); throw new Error("Only public text and HTML pages can be read."); }
+      if (!/text\/(html|plain)|application\/(xhtml\+xml|json)/i.test(contentType)) { await response.body?.cancel(); throw new Error("Only public text, HTML, and approved research data can be read."); }
       const text = await readLimitedBody(response.body);
       return { url: target.url.toString(), contentType, text };
     } finally {
@@ -123,4 +136,42 @@ export async function readPublicWebPage(input: string): Promise<string> {
   const response = await publicFetch(input);
   const body = /html|xhtml/i.test(response.contentType) ? textFromHtml(response.text) : response.text.replace(/\s+/g, " ").trim();
   return `Source: ${response.url}\nAccessed: ${new Date().toISOString()}\n\n${body.slice(0, 24_000)}`;
+}
+
+export async function geocodePublicPlace(query: string): Promise<GeocodeResult[]> {
+  const clean = query.trim().slice(0, 300);
+  if (!clean) throw new Error("A business name or address is required for map lookup.");
+  const response = await publicFetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&addressdetails=1&q=${encodeURIComponent(clean)}`);
+  const parsed = JSON.parse(response.text) as Array<{ display_name?: string; lat?: string; lon?: string; type?: string; category?: string }>;
+  return parsed.map((item) => GeocodeResultSchema.parse({
+    displayName: item.display_name,
+    latitude: Number(item.lat),
+    longitude: Number(item.lon),
+    kind: item.type || item.category || "place",
+  }));
+}
+
+export async function discoverLocalBusinesses(location: string, category = ""): Promise<string> {
+  const cleanLocation = location.trim().slice(0, 200);
+  if (!cleanLocation) throw new Error("A city and state or region are required for local business discovery.");
+  const center = (await geocodePublicPlace(cleanLocation))[0];
+  if (!center) throw new Error(`No public map location was found for: ${cleanLocation}`);
+  const categoryHint = category.trim().slice(0, 100);
+  const query = `[out:json][timeout:15];nwr(around:8000,${center.latitude},${center.longitude})["name"]["shop"];out center tags 80;`;
+  const response = await publicFetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`);
+  const parsed = JSON.parse(response.text) as { elements?: Array<{ id?: number; type?: string; lat?: number; lon?: number; center?: { lat?: number; lon?: number }; tags?: Record<string, string> }> };
+  const seen = new Set<string>();
+  const candidates = (parsed.elements ?? []).flatMap((item) => {
+    const tags = item.tags ?? {}; const name = tags.name?.trim();
+    const latitude = item.lat ?? item.center?.lat; const longitude = item.lon ?? item.center?.lon;
+    const type = tags.shop || tags.craft || tags.office || "business";
+    if (!name || tags.website || tags["contact:website"] || !Number.isFinite(latitude) || !Number.isFinite(longitude) || seen.has(name.toLowerCase())) return [];
+    if (categoryHint && !`${name} ${type}`.toLowerCase().includes(categoryHint.toLowerCase())) return [];
+    seen.add(name.toLowerCase());
+    const street = [tags["addr:housenumber"], tags["addr:street"]].filter(Boolean).join(" ");
+    const address = [street, tags["addr:city"] || cleanLocation, tags["addr:postcode"]].filter(Boolean).join(", ");
+    return [{ name, type, address, latitude, longitude, phone: tags.phone || tags["contact:phone"] || "", mapSource: `https://www.openstreetmap.org/${item.type || "node"}/${item.id ?? ""}` }];
+  }).slice(0, 30);
+  if (!candidates.length) return `No map-listed business candidates without a website field were found near ${cleanLocation}${categoryHint ? ` for category ${categoryHint}` : ""}.`;
+  return `LOCAL DISCOVERY CANDIDATES near ${center.displayName}\n\nOpenStreetMap does not list a website for these records. That is a prospecting signal, not proof that no website exists. Verify each candidate with web_search before recommending outreach or mapping it.\n\n${JSON.stringify(candidates, null, 2)}`;
 }

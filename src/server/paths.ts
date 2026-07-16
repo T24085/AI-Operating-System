@@ -3,6 +3,7 @@ import { access, lstat, mkdir, readFile, realpath, rename, writeFile } from "nod
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 const MAX_TEXT_BYTES = 1_048_576;
+const MAX_BINARY_BYTES = 10_000_000;
 
 function isInside(root: string, target: string): boolean {
   const rel = relative(root, target);
@@ -48,6 +49,16 @@ export async function atomicWriteText(workspaceRoot: string, requestedPath: stri
   await mkdir(dirname(target), { recursive: true });
   const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(temp, content, { encoding: "utf8", flag: "wx" });
+  await rename(temp, target);
+  return target;
+}
+
+export async function atomicWriteBuffer(workspaceRoot: string, requestedPath: string, content: Uint8Array): Promise<string> {
+  if (content.byteLength > MAX_BINARY_BYTES) throw new Error("File exceeds the 10 MB employee-file limit.");
+  const target = await resolveSafePath(workspaceRoot, requestedPath);
+  await mkdir(dirname(target), { recursive: true });
+  const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(temp, content, { flag: "wx" });
   await rename(temp, target);
   return target;
 }

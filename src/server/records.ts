@@ -67,6 +67,16 @@ export class WorkspaceRecords {
     }
     await mkdir(join(this.root, "shared", "handoffs"), { recursive: true });
     await mkdir(join(this.root, "shared", "tasks"), { recursive: true });
+    const salesLibrary = join(this.root, "shared", "employee-files", "sales");
+    await mkdir(salesLibrary, { recursive: true });
+    for (const file of ["Samuel_Studio_Employee_Sales_Guide.pdf", "Samuel_Studio_Employee_Sales_Guide.md"]) {
+      const destination = join(salesLibrary, file);
+      if (!(await pathExists(this.root, `shared/employee-files/sales/${file}`))) {
+        const seed = join(process.cwd(), "seed", "employee-files", "sales", file);
+        try { await copyFile(seed, destination); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      }
+    }
     await mkdir(join(this.root, "index"), { recursive: true });
     await this.ensureOperatingFiles();
   }
@@ -104,6 +114,16 @@ export class WorkspaceRecords {
     }
     await mkdir(join(this.root, "shared", "handoffs"), { recursive: true });
     await mkdir(join(this.root, "shared", "tasks"), { recursive: true });
+    const salesLibrary = join(this.root, "shared", "employee-files", "sales");
+    await mkdir(salesLibrary, { recursive: true });
+    for (const file of ["Samuel_Studio_Employee_Sales_Guide.pdf", "Samuel_Studio_Employee_Sales_Guide.md"]) {
+      const destination = join(salesLibrary, file);
+      if (!(await pathExists(this.root, `shared/employee-files/sales/${file}`))) {
+        const seed = join(process.cwd(), "seed", "employee-files", "sales", file);
+        try { await copyFile(seed, destination); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      }
+    }
     await mkdir(join(this.root, "index"), { recursive: true });
   }
 

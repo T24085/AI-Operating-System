@@ -23,13 +23,29 @@ import type {
   Project,
   Quote,
   WorkItem,
+  LedgerResponse,
+  EmployeeFile,
   BackupManifest,
   DiagnosticsResponse,
+  GeocodeResult,
+  ResearchPlace,
+  ResearchPlaceInput,
+  FrontDeskResponse,
+  PublicServiceCaseSummary,
+  ServiceCase,
+  SalesQualification,
+  SalesOperationsResponse,
+  PublicSalesProgressSummary,
+  Campaign,
+  CampaignAsset,
+  CampaignFile,
+  CampaignOperationsResponse,
+  CampaignPost,
 } from "../shared/schemas";
 
 export interface DeliverableGrantSummary { id: string; issuedAt: string; revokedAt: string | null }
 
-export interface CrmData { contacts: CrmContact[]; leads: CrmLead[]; appointments: CrmAppointment[]; tasks: CrmTask[]; conversations: CrmConversation[]; activities: CrmActivity[]; workItems: WorkItem[]; deliverables: Deliverable[]; quotes: Quote[]; projects: Project[] }
+export interface CrmData { contacts: CrmContact[]; leads: CrmLead[]; appointments: CrmAppointment[]; tasks: CrmTask[]; conversations: CrmConversation[]; activities: CrmActivity[]; workItems: WorkItem[]; deliverables: Deliverable[]; quotes: Quote[]; projects: Project[]; serviceCases: ServiceCase[]; salesQualifications?: SalesQualification[]; campaigns?: Campaign[] }
 
 export interface BootstrapData {
   onboarded: boolean;
@@ -50,7 +66,11 @@ async function json<T>(url: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: { ...(hasBody ? { "Content-Type": "application/json" } : {}), ...(csrfToken && init?.method && init.method !== "GET" ? { "X-CSRF-Token": csrfToken } : {}), ...(init?.headers ?? {}) },
   });
-  const data = await response.json();
+  const body = await response.text();
+  if (!body.trim()) throw new Error("The server connection ended before confirmation. Refreshing the workspace will show whether the action completed.");
+  let data: { error?: string };
+  try { data = JSON.parse(body) as { error?: string }; }
+  catch { throw new Error("The server returned an incomplete response. Refresh the workspace and check the recorded action status before retrying."); }
   if (!response.ok) throw new Error(data.error ?? `Request failed with ${response.status}.`);
   return data as T;
 }
@@ -73,6 +93,23 @@ export const api = {
   openFolder: () => json<{ ok: boolean }>("/api/open-folder", { method: "POST" }),
   backup: () => json<{ ok: true; path: string }>("/api/admin/backup", { method: "POST" }),
   diagnostics: () => json<DiagnosticsResponse>("/api/admin/diagnostics"),
+  frontDesk: () => json<FrontDeskResponse>("/api/admin/front-desk"),
+  serviceCases: () => json<ServiceCase[]>("/api/admin/service-cases"),
+  serviceCase: (id: string) => json<ServiceCase>(`/api/admin/service-cases/${encodeURIComponent(id)}`),
+  createServiceCase: (input: { contactId: string; leadId?: string | null; conversationId: string; appointmentId?: string | null; workItemId?: string | null; title: string; category?: ServiceCase["category"]; priority?: ServiceCase["priority"]; summary: string; desiredOutcome?: string; nextStep?: string; internalNotes?: string; createdBy?: "owner" | "receptionist" | "system" }) => json<ServiceCase>("/api/admin/service-cases", { method: "POST", body: JSON.stringify(input) }),
+  updateServiceCase: (id: string, input: Partial<Pick<ServiceCase, "status" | "priority" | "category" | "summary" | "desiredOutcome" | "nextStep" | "internalNotes">>) => json<ServiceCase>(`/api/admin/service-cases/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(input) }),
+  salesOperations: () => json<SalesOperationsResponse>("/api/admin/sales-operations"),
+  salesQualifications: () => json<SalesQualification[]>("/api/admin/sales-qualifications"),
+  salesQualification: (id: string) => json<SalesQualification>(`/api/admin/sales-qualifications/${encodeURIComponent(id)}`),
+  createSalesQualification: (input: { contactId: string; leadId: string; conversationId?: string | null; appointmentId?: string | null; title: string; serviceInterest?: string; projectGoal?: string; deliverables?: string[]; targetTiming?: string; location?: string; budgetState?: SalesQualification["budgetState"]; budgetRange?: string; decisionMakerState?: SalesQualification["decisionMakerState"]; decisionMakers?: string; constraints?: string[]; nextStep?: string; createdBy?: "owner" | "receptionist" | "system" }) => json<SalesQualification>("/api/admin/sales-qualifications", { method: "POST", body: JSON.stringify(input) }),
+  updateSalesQualification: (id: string, input: Partial<Pick<SalesQualification, "serviceInterest" | "projectGoal" | "deliverables" | "targetTiming" | "location" | "budgetState" | "budgetRange" | "decisionMakerState" | "decisionMakers" | "constraints" | "readiness" | "nextStep">> & { evidence?: Array<{ kind: "company" | "offer" | "sales_library"; path: string; label: string; excerpt?: string }> }) => json<SalesQualification>(`/api/admin/sales-qualifications/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(input) }),
+  campaignOperations: () => json<CampaignOperationsResponse>("/api/admin/campaign-operations"),
+  campaigns: () => json<Campaign[]>("/api/admin/campaigns"),
+  createCampaign: (input: { title: string; businessLine?: string; objective?: string; audience?: string; offer?: string; channels?: string[]; callToAction?: string; projectId?: string | null; contactId?: string | null; leadId?: string | null; salesQualificationId?: string | null }) => json<Campaign>("/api/admin/campaigns", { method: "POST", body: JSON.stringify(input) }),
+  updateCampaign: (id: string, input: Partial<Campaign>) => json<Campaign>(`/api/admin/campaigns/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(input) }),
+  createCampaignPost: (campaignId: string, input: { platform: string; plannedAt?: string | null; objective?: string; copy?: string; callToAction?: string; destinationUrl?: string | null; altText?: string; assetIds?: string[]; claims?: string[]; status?: CampaignPost["status"] }) => json<CampaignPost>(`/api/admin/campaigns/${encodeURIComponent(campaignId)}/posts`, { method: "POST", body: JSON.stringify(input) }),
+  updateCampaignPost: (campaignId: string, postId: string, input: Partial<CampaignPost> & Record<string, unknown>) => json<CampaignPost>(`/api/admin/campaigns/${encodeURIComponent(campaignId)}/posts/${encodeURIComponent(postId)}`, { method: "PATCH", body: JSON.stringify(input) }),
+  updateCampaignAsset: (campaignId: string, assetId: string, input: Partial<CampaignAsset>) => json<CampaignAsset>(`/api/admin/campaigns/${encodeURIComponent(campaignId)}/assets/${encodeURIComponent(assetId)}`, { method: "PATCH", body: JSON.stringify(input) }),
   reindex: () => json<{ ok: true; indexFreshAt: string }>("/api/admin/reindex", { method: "POST" }),
   backups: () => json<BackupManifest[]>("/api/admin/backups"),
   createBackup: () => json<BackupManifest>("/api/admin/backups", { method: "POST" }),
@@ -101,9 +138,14 @@ export const api = {
   quotes: () => json<Quote[]>("/api/quotes"),
   offers: () => json<Offer[]>("/api/offers"),
   projects: () => json<Project[]>("/api/projects"),
+  ledger: () => json<LedgerResponse>("/api/finance/ledger"),
+  researchPlaces: () => json<ResearchPlace[]>("/api/research/places"),
+  saveResearchPlace: (input: ResearchPlaceInput) => json<ResearchPlace>("/api/research/places", { method: "POST", body: JSON.stringify(input) }),
+  geocodeResearchPlace: (query: string) => json<GeocodeResult[]>(`/api/research/geocode?q=${encodeURIComponent(query)}`),
+  employeeLibrary: (id: EmployeeId) => json<EmployeeFile[]>(`/api/employee-files/${encodeURIComponent(id)}`),
   createProject: (input: { contactId?: string; leadId?: string; name: string; business: string; brief: string; nextStep?: string }) => json<Project>("/api/projects", { method: "POST", body: JSON.stringify(input) }),
   publicIntake: (input: PublicIntake) => json<{ conversationId: string; contactId: string; leadId: string; resumeToken: string }>("/api/public/intake", { method: "POST", body: JSON.stringify(input) }),
-  publicResume: (conversationId: string, token: string) => json<{ conversationId: string; intake: PublicIntake; messages: PublicConversationMessage[]; deliverables: Deliverable[]; lastActivity: string }>(`/api/public/conversations/${encodeURIComponent(conversationId)}/resume`, { method: "POST", body: JSON.stringify({ token }) }),
+  publicResume: (conversationId: string, token: string) => json<{ conversationId: string; intake: PublicIntake; messages: PublicConversationMessage[]; deliverables: Deliverable[]; serviceCases?: PublicServiceCaseSummary[]; salesProgress?: PublicSalesProgressSummary[]; lastActivity: string }>(`/api/public/conversations/${encodeURIComponent(conversationId)}/resume`, { method: "POST", body: JSON.stringify({ token }) }),
 };
 
 export async function streamEmployeeMessage(conversationId: string, content: string, onEvent: (event: AgentEvent) => void): Promise<void> {
@@ -132,6 +174,28 @@ export async function streamEmployeeMessage(conversationId: string, content: str
     }
   }
 }
+
+export async function uploadEmployeeFile(employeeId: EmployeeId, file: File): Promise<{ path: string; agentReadable: boolean }> {
+  const response = await fetch(`/api/employee-files/${encodeURIComponent(employeeId)}/upload?name=${encodeURIComponent(file.name)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream", ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}) },
+    body: file,
+  });
+  const body = await response.text();
+  let data: { path?: string; agentReadable?: boolean; error?: string } = {};
+  try { data = body ? JSON.parse(body) as typeof data : {}; } catch { throw new Error("The server returned an incomplete upload response."); }
+  if (!response.ok) throw new Error(data.error ?? `Upload failed with ${response.status}.`);
+  return { path: data.path!, agentReadable: Boolean(data.agentReadable) };
+}
+
+async function uploadBinary<T>(url: string, file: File): Promise<T> {
+  const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/octet-stream", ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}) }, body: file });
+  const body = await response.text(); let data: { error?: string } = {};
+  try { data = body ? JSON.parse(body) as typeof data : {}; } catch { throw new Error("The server returned an incomplete upload response."); }
+  if (!response.ok) throw new Error(data.error ?? `Upload failed with ${response.status}.`); return data as T;
+}
+export const uploadCampaignAsset = (campaignId: string, file: File) => uploadBinary<CampaignAsset>(`/api/admin/campaigns/${encodeURIComponent(campaignId)}/assets?name=${encodeURIComponent(file.name)}`, file);
+export const uploadCampaignPdf = (campaignId: string, kind: CampaignFile["kind"], provenance: string, file: File) => uploadBinary<CampaignFile>(`/api/admin/campaign-files/upload?campaignId=${encodeURIComponent(campaignId)}&kind=${encodeURIComponent(kind)}&provenance=${encodeURIComponent(provenance)}&name=${encodeURIComponent(file.name)}`, file);
 
 export async function streamPublicMessage(conversationId: string, content: string, onEvent: (event: PublicAgentEvent) => void): Promise<void> {
   const response = await fetch(`/api/public/conversations/${conversationId}/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content }) });
